@@ -1,4 +1,6 @@
+import 'dart:async';
 import 'dart:io';
+import 'dart:isolate';
 import 'dart:math' as math;
 import 'dart:typed_data';
 import 'dart:ui' show Offset, Rect;
@@ -33,7 +35,9 @@ class FileToolsService {
     "et",
   };
 
-  Future<List<FileToolsFileInfo>> queryFileList(FileToolsDocumentType type) async {
+  Future<List<FileToolsFileInfo>> queryFileList(
+    FileToolsDocumentType type,
+  ) async {
     if (!Platform.isAndroid) {
       return <FileToolsFileInfo>[];
     }
@@ -144,70 +148,15 @@ class FileToolsService {
       throw Exception("At least two files should be selected");
     }
     onProgress?.call(0);
-    PdfDocument? outputDocument;
-    final List<PdfDocument> sourceDocumentList = <PdfDocument>[];
-    try {
-      int totalPageCount = 0;
-      for (final bean in fileList) {
-        await taskControl?.checkpoint();
-        final path = bean.path ?? "";
-        if (path.isEmpty) {
-          throw Exception("File path is invalid");
-        }
-        final file = File(path);
-        if (!await file.exists()) {
-          throw Exception("The file does not exist. Please select another file");
-        }
-        final sourceDocument = PdfDocument(inputBytes: await file.readAsBytes());
-        sourceDocumentList.add(sourceDocument);
-        totalPageCount += sourceDocument.pages.count;
-      }
-      if (totalPageCount <= 0) {
-        throw Exception("Failed to merge PDF files");
-      }
-      outputDocument = PdfDocument();
-      outputDocument.pageSettings.setMargins(0);
-      int completedPageCount = 0;
-      for (final sourceDocument in sourceDocumentList) {
-        for (int index = 0; index < sourceDocument.pages.count; index++) {
-          await taskControl?.checkpoint();
-          final sourcePage = sourceDocument.pages[index];
-          outputDocument.pageSettings.size = sourcePage.size;
-          final targetPage = outputDocument.pages.add();
-          targetPage.graphics.drawPdfTemplate(
-            sourcePage.createTemplate(),
-            Offset.zero,
-            sourcePage.size,
-          );
-          completedPageCount++;
-          onProgress?.call(completedPageCount / totalPageCount);
-        }
-      }
-      await taskControl?.checkpoint();
-      final outputFile = await _createSequentialOutputFile(
-        prefix: "Merge",
-        extension: "pdf",
-      );
-      await taskControl?.checkpoint();
-      final bytes = await outputDocument.save();
-      await taskControl?.checkpoint();
-      await outputFile.writeAsBytes(bytes, flush: true);
-      await FlutterPreviewFile.scanFile(outputFile.path);
-      final stat = await outputFile.stat();
-      onProgress?.call(1);
-      return FileToolsFileInfo(
-        name: outputFile.uri.pathSegments.last,
-        type: FileToolsDocumentType.pdf,
-        updateTime: stat.modified.millisecondsSinceEpoch,
-        size: stat.size,
-        path: outputFile.path,
-      );
-    } finally {
-      for (final document in sourceDocumentList) {
-        document.dispose();
-      }
-      outputDocument?.dispose();
-    }
+    final result = await _runMergePdfFilesInBackground(
+      fileList: fileList,
+      onProgress: onProgress,
+      taskControl: taskControl,
+    );
+    await taskControl?.checkpoint();
+    await FlutterPreviewFile.scanFile(result.path ?? "");
+    onProgress?.call(1);
+    return result;
   }
 
   Future<FileToolsFileInfo> splitPdfFile({
@@ -228,57 +177,20 @@ class FileToolsService {
       throw Exception("The file does not exist. Please select another file");
     }
     onProgress?.call(0);
-    PdfDocument? sourceDocument;
-    PdfDocument? outputDocument;
-    try {
-      sourceDocument = PdfDocument(inputBytes: await file.readAsBytes());
-      final totalPageCount = sourceDocument.pages.count;
-      final normalizedPageIndexList = <int>[];
-      for (final index in selectedPageIndexList) {
-        if (index >= 0 && index < totalPageCount) {
-          normalizedPageIndexList.add(index);
-        }
-      }
-      if (normalizedPageIndexList.isEmpty) {
-        throw Exception("Please select at least one valid page");
-      }
-      outputDocument = PdfDocument();
-      outputDocument.pageSettings.setMargins(0);
-      for (int i = 0; i < normalizedPageIndexList.length; i++) {
-        await taskControl?.checkpoint();
-        final sourcePage = sourceDocument.pages[normalizedPageIndexList[i]];
-        outputDocument.pageSettings.size = sourcePage.size;
-        final targetPage = outputDocument.pages.add();
-        targetPage.graphics.drawPdfTemplate(
-          sourcePage.createTemplate(),
-          Offset.zero,
-          sourcePage.size,
-        );
-        onProgress?.call((i + 1) / normalizedPageIndexList.length);
-      }
-      await taskControl?.checkpoint();
-      final outputFile = await _createSequentialOutputFile(
-        prefix: "split",
-        extension: "pdf",
-      );
-      await taskControl?.checkpoint();
-      final bytes = await outputDocument.save();
-      await taskControl?.checkpoint();
-      await outputFile.writeAsBytes(bytes, flush: true);
-      await FlutterPreviewFile.scanFile(outputFile.path);
-      final stat = await outputFile.stat();
-      onProgress?.call(1);
-      return FileToolsFileInfo(
-        name: outputFile.uri.pathSegments.last,
-        type: FileToolsDocumentType.pdf,
-        updateTime: stat.modified.millisecondsSinceEpoch,
-        size: stat.size,
-        path: outputFile.path,
-      );
-    } finally {
-      sourceDocument?.dispose();
-      outputDocument?.dispose();
-    }
+    final result = await _runFileToolsTaskInBackground(
+      isolateEntry: _splitPdfFileIsolateEntry,
+      payload: <String, dynamic>{
+        "fileInfo": _fileInfoToMap(fileInfo),
+        "selectedPageIndexList": List<int>.from(selectedPageIndexList),
+      },
+      fallbackErrorMessage: "Failed to split PDF",
+      onProgress: onProgress,
+      taskControl: taskControl,
+    );
+    await taskControl?.checkpoint();
+    await FlutterPreviewFile.scanFile(result.path ?? "");
+    onProgress?.call(1);
+    return result;
   }
 
   Future<FileToolsFileInfo> convertWordToPdfFile({
@@ -342,37 +254,17 @@ class FileToolsService {
       throw Exception("The file does not exist. Please select another file");
     }
     onProgress?.call(0);
-    await taskControl?.checkpoint();
-    onProgress?.call(0.15);
-    final outputFile = await _createSequentialOutputFile(
-      prefix: "pdf2word",
-      extension: "docx",
+    final result = await _runFileToolsTaskInBackground(
+      isolateEntry: _convertPdfToWordFileIsolateEntry,
+      payload: <String, dynamic>{"fileInfo": _fileInfoToMap(fileInfo)},
+      fallbackErrorMessage: "Failed to convert PDF to Word",
+      onProgress: onProgress,
+      taskControl: taskControl,
     );
     await taskControl?.checkpoint();
-    onProgress?.call(0.3);
-    try {
-      await FlutterPreviewFile.convertPdfToWord(
-        inputPath: path,
-        outputPath: outputFile.path,
-      );
-      await taskControl?.checkpoint();
-      onProgress?.call(0.9);
-      await FlutterPreviewFile.scanFile(outputFile.path);
-      final stat = await outputFile.stat();
-      onProgress?.call(1);
-      return FileToolsFileInfo(
-        name: outputFile.uri.pathSegments.last,
-        type: FileToolsDocumentType.word,
-        updateTime: stat.modified.millisecondsSinceEpoch,
-        size: stat.size,
-        path: outputFile.path,
-      );
-    } catch (_) {
-      if (await outputFile.exists()) {
-        await outputFile.delete();
-      }
-      rethrow;
-    }
+    await FlutterPreviewFile.scanFile(result.path ?? "");
+    onProgress?.call(1);
+    return result;
   }
 
   Future<FileToolsFileInfo> extractPdfTextFile({
@@ -393,40 +285,20 @@ class FileToolsService {
       throw Exception("Please select at least one page");
     }
     onProgress?.call(0);
-    await taskControl?.checkpoint();
-    final outputFile = await _createSequentialOutputFile(
-      prefix: "ExtractText",
-      extension: "txt",
+    final result = await _runFileToolsTaskInBackground(
+      isolateEntry: _extractPdfTextFileIsolateEntry,
+      payload: <String, dynamic>{
+        "fileInfo": _fileInfoToMap(fileInfo),
+        "selectedPageIndexList": List<int>.from(selectedPageIndexList),
+      },
+      fallbackErrorMessage: "Failed to extract text",
+      onProgress: onProgress,
+      taskControl: taskControl,
     );
     await taskControl?.checkpoint();
-    try {
-      final text = await FlutterPreviewFile.extractPdfText(
-        inputPath: path,
-        selectedPageIndexList: List<int>.from(selectedPageIndexList),
-        onProgress: (progress) async {
-          await taskControl?.checkpoint();
-          onProgress?.call(progress);
-        },
-      );
-      await taskControl?.checkpoint();
-      await outputFile.writeAsString(text, flush: true);
-      await taskControl?.checkpoint();
-      await FlutterPreviewFile.scanFile(outputFile.path);
-      final stat = await outputFile.stat();
-      onProgress?.call(1);
-      return FileToolsFileInfo(
-        name: outputFile.uri.pathSegments.last,
-        type: FileToolsDocumentType.word,
-        updateTime: stat.modified.millisecondsSinceEpoch,
-        size: stat.size,
-        path: outputFile.path,
-      );
-    } catch (_) {
-      if (await outputFile.exists()) {
-        await outputFile.delete();
-      }
-      rethrow;
-    }
+    await FlutterPreviewFile.scanFile(result.path ?? "");
+    onProgress?.call(1);
+    return result;
   }
 
   Future<List<FileToolsFileInfo>> queryAllImages() async {
@@ -460,7 +332,10 @@ class FileToolsService {
     const pageSize = 200;
     final List<FileToolsFileInfo> result = <FileToolsFileInfo>[];
     for (int page = 0; page * pageSize < totalCount; page++) {
-      final assetList = await assetPath.getAssetListPaged(page: page, size: pageSize);
+      final assetList = await assetPath.getAssetListPaged(
+        page: page,
+        size: pageSize,
+      );
       if (assetList.isEmpty) {
         break;
       }
@@ -511,70 +386,20 @@ class FileToolsService {
       throw Exception("Please select at least one image");
     }
     onProgress?.call(0);
-    PdfDocument? outputDocument;
-    try {
-      outputDocument = PdfDocument();
-      outputDocument.pageSettings.setMargins(0);
-      final totalCount = imageList.length;
-      for (int index = 0; index < totalCount; index++) {
-        await taskControl?.checkpoint();
-        final bean = imageList[index];
-        final path = bean.path ?? "";
-        if (path.isEmpty) {
-          throw Exception("Image path is invalid");
-        }
-        final file = File(path);
-        if (!await file.exists()) {
-          throw Exception("The image does not exist. Please select another image");
-        }
-        final imageBytes = await file.readAsBytes();
-        await taskControl?.checkpoint();
-        final bitmap = PdfBitmap(imageBytes);
-        outputDocument.pageSettings
-          ..orientation = bitmap.width >= bitmap.height
-              ? PdfPageOrientation.landscape
-              : PdfPageOrientation.portrait
-          ..size = PdfPageSize.a4;
-        final page = outputDocument.pages.add();
-        final clientSize = page.getClientSize();
-        final imageWidth = bitmap.width.toDouble();
-        final imageHeight = bitmap.height.toDouble();
-        final scale = math.min(
-          clientSize.width / imageWidth,
-          clientSize.height / imageHeight,
-        );
-        final drawWidth = imageWidth * scale;
-        final drawHeight = imageHeight * scale;
-        page.graphics.drawImage(
-          bitmap,
-          Rect.fromLTWH(
-            (clientSize.width - drawWidth) / 2,
-            (clientSize.height - drawHeight) / 2,
-            drawWidth,
-            drawHeight,
-          ),
-        );
-        onProgress?.call((index + 1) / totalCount);
-      }
-      await taskControl?.checkpoint();
-      final outputFile = await _createImagesToPdfOutputFile(outputFileName: outputFileName);
-      await taskControl?.checkpoint();
-      final bytes = await outputDocument.save();
-      await taskControl?.checkpoint();
-      await outputFile.writeAsBytes(bytes, flush: true);
-      await FlutterPreviewFile.scanFile(outputFile.path);
-      final stat = await outputFile.stat();
-      onProgress?.call(1);
-      return FileToolsFileInfo(
-        name: outputFile.uri.pathSegments.last,
-        type: FileToolsDocumentType.pdf,
-        updateTime: stat.modified.millisecondsSinceEpoch,
-        size: stat.size,
-        path: outputFile.path,
-      );
-    } finally {
-      outputDocument?.dispose();
-    }
+    final result = await _runFileToolsTaskInBackground(
+      isolateEntry: _generatePdfFromImagesIsolateEntry,
+      payload: <String, dynamic>{
+        "imageList": imageList.map(_fileInfoToMap).toList(growable: false),
+        "outputFileName": outputFileName,
+      },
+      fallbackErrorMessage: "Failed to generate PDF",
+      onProgress: onProgress,
+      taskControl: taskControl,
+    );
+    await taskControl?.checkpoint();
+    await FlutterPreviewFile.scanFile(result.path ?? "");
+    onProgress?.call(1);
+    return result;
   }
 
   Future<FileToolsPdfToImagesZipResult> extractPdfToImagesZip({
@@ -608,7 +433,9 @@ class FileToolsService {
     if (totalPageCount <= 0) {
       throw Exception("Failed to extract images from PDF");
     }
-    final tempDirectory = await Directory.systemTemp.createTemp("pdf_to_images_");
+    final tempDirectory = await Directory.systemTemp.createTemp(
+      "pdf_to_images_",
+    );
     File? zipFile;
     try {
       final totalStepCount = totalPageCount * 2;
@@ -642,7 +469,10 @@ class FileToolsService {
         throw Exception("Failed to extract images from PDF");
       }
       await taskControl?.checkpoint();
-      zipFile = await _createSequentialOutputFile(prefix: "Zip", extension: "zip");
+      zipFile = await _createSequentialOutputFile(
+        prefix: "Zip",
+        extension: "zip",
+      );
       final encoder = ZipFileEncoder();
       try {
         encoder.create(zipFile.path);
@@ -766,7 +596,9 @@ Future<FileToolsFileInfo?> _toImageFileInfo(AssetEntity entity) async {
   );
 }
 
-Future<List<Map<String, dynamic>>> _scanFileList(FileToolsDocumentType type) async {
+Future<List<Map<String, dynamic>>> _scanFileList(
+  FileToolsDocumentType type,
+) async {
   final List<Map<String, dynamic>> fileList = <Map<String, dynamic>>[];
   final Set<String> pathSet = <String>{};
   final roots = _querySearchRoots();
@@ -780,7 +612,9 @@ Future<List<Map<String, dynamic>>> _scanFileList(FileToolsDocumentType type) asy
       scanState: scanState,
     );
   }
-  fileList.sort((a, b) => (b["updateTime"] as int).compareTo(a["updateTime"] as int));
+  fileList.sort(
+    (a, b) => (b["updateTime"] as int).compareTo(a["updateTime"] as int),
+  );
   return fileList;
 }
 
@@ -828,7 +662,9 @@ Future<void> _collectFilesFromDirectory({
       try {
         final stat = await entity.stat();
         fileList.add(<String, dynamic>{
-          "name": entity.uri.pathSegments.isEmpty ? entity.path : entity.uri.pathSegments.last,
+          "name": entity.uri.pathSegments.isEmpty
+              ? entity.path
+              : entity.uri.pathSegments.last,
           "typeIndex": fileType.index,
           "updateTime": stat.modified.millisecondsSinceEpoch,
           "size": stat.size,
@@ -987,6 +823,539 @@ Future<File> _createSequentialOutputFile({
     }
     index++;
   }
+}
+
+Future<FileToolsFileInfo> _runMergePdfFilesInBackground({
+  required List<FileToolsFileInfo> fileList,
+  FileToolsProgressCallback? onProgress,
+  FileToolsTaskControl? taskControl,
+}) async {
+  await taskControl?.checkpoint();
+  final receivePort = ReceivePort();
+  final isolate = await Isolate.spawn<Map<String, dynamic>>(
+    _mergePdfFilesIsolateEntry,
+    <String, dynamic>{
+      "sendPort": receivePort.sendPort,
+      "fileList": fileList.map(_fileInfoToMap).toList(growable: false),
+    },
+  );
+  final completer = Completer<FileToolsFileInfo>();
+  late final StreamSubscription<dynamic> subscription;
+  Timer? cancelTimer;
+
+  subscription = receivePort.listen((message) {
+    if (message is! Map) {
+      return;
+    }
+    final type = message["type"]?.toString() ?? "";
+    switch (type) {
+      case "progress":
+        final value = message["value"];
+        if (value is num) {
+          onProgress?.call(value.toDouble().clamp(0, 0.99));
+        }
+        break;
+      case "result":
+        final rawFileInfo = message["fileInfo"];
+        if (rawFileInfo is Map<String, dynamic>) {
+          completer.complete(_fileInfoFromMap(rawFileInfo));
+        } else if (rawFileInfo is Map) {
+          completer.complete(
+            _fileInfoFromMap(Map<String, dynamic>.from(rawFileInfo)),
+          );
+        } else {
+          completer.completeError(Exception("Failed to merge PDF files"));
+        }
+        break;
+      case "error":
+        final messageText =
+            message["message"]?.toString() ?? "Failed to merge PDF files";
+        completer.completeError(Exception(messageText));
+        break;
+    }
+  });
+
+  cancelTimer = Timer.periodic(const Duration(milliseconds: 120), (_) {
+    if (taskControl?.isCanceled == true && !completer.isCompleted) {
+      completer.completeError(const FileToolsCanceledException());
+    }
+  });
+
+  try {
+    return await completer.future;
+  } finally {
+    cancelTimer.cancel();
+    await subscription.cancel();
+    receivePort.close();
+    isolate.kill(priority: Isolate.immediate);
+  }
+}
+
+Future<FileToolsFileInfo> _runFileToolsTaskInBackground({
+  required Future<void> Function(Map<String, dynamic>) isolateEntry,
+  required Map<String, dynamic> payload,
+  required String fallbackErrorMessage,
+  FileToolsProgressCallback? onProgress,
+  FileToolsTaskControl? taskControl,
+}) async {
+  await taskControl?.checkpoint();
+  final receivePort = ReceivePort();
+  final isolate = await Isolate.spawn<Map<String, dynamic>>(
+    isolateEntry,
+    <String, dynamic>{"sendPort": receivePort.sendPort, ...payload},
+  );
+  final completer = Completer<FileToolsFileInfo>();
+  late final StreamSubscription<dynamic> subscription;
+  Timer? cancelTimer;
+
+  subscription = receivePort.listen((message) {
+    if (message is! Map) {
+      return;
+    }
+    final type = message["type"]?.toString() ?? "";
+    switch (type) {
+      case "progress":
+        final value = message["value"];
+        if (value is num) {
+          onProgress?.call(value.toDouble().clamp(0, 0.99));
+        }
+        break;
+      case "result":
+        final rawFileInfo = message["fileInfo"];
+        if (completer.isCompleted) {
+          return;
+        }
+        if (rawFileInfo is Map<String, dynamic>) {
+          completer.complete(_fileInfoFromMap(rawFileInfo));
+        } else if (rawFileInfo is Map) {
+          completer.complete(
+            _fileInfoFromMap(Map<String, dynamic>.from(rawFileInfo)),
+          );
+        } else {
+          completer.completeError(Exception(fallbackErrorMessage));
+        }
+        break;
+      case "error":
+        if (completer.isCompleted) {
+          return;
+        }
+        final messageText =
+            message["message"]?.toString() ?? fallbackErrorMessage;
+        completer.completeError(Exception(messageText));
+        break;
+    }
+  });
+
+  cancelTimer = Timer.periodic(const Duration(milliseconds: 120), (_) {
+    if (taskControl?.isCanceled == true && !completer.isCompleted) {
+      completer.completeError(const FileToolsCanceledException());
+    }
+  });
+
+  try {
+    return await completer.future;
+  } finally {
+    cancelTimer.cancel();
+    await subscription.cancel();
+    receivePort.close();
+    isolate.kill(priority: Isolate.immediate);
+  }
+}
+
+Future<void> _mergePdfFilesIsolateEntry(Map<String, dynamic> message) async {
+  final sendPort = message["sendPort"] as SendPort;
+  final rawFileInfoList = message["fileList"] as List<dynamic>? ?? <dynamic>[];
+  PdfDocument? outputDocument;
+  final List<PdfDocument> sourceDocumentList = <PdfDocument>[];
+  try {
+    final fileList = rawFileInfoList
+        .whereType<Map>()
+        .map((item) => _fileInfoFromMap(Map<String, dynamic>.from(item)))
+        .toList(growable: false);
+    int totalPageCount = 0;
+    for (final bean in fileList) {
+      final path = bean.path ?? "";
+      if (path.isEmpty) {
+        throw Exception("File path is invalid");
+      }
+      final file = File(path);
+      if (!await file.exists()) {
+        throw Exception("The file does not exist. Please select another file");
+      }
+      final sourceDocument = PdfDocument(inputBytes: await file.readAsBytes());
+      sourceDocumentList.add(sourceDocument);
+      totalPageCount += sourceDocument.pages.count;
+    }
+    if (totalPageCount <= 0) {
+      throw Exception("Failed to merge PDF files");
+    }
+    outputDocument = PdfDocument();
+    outputDocument.pageSettings.setMargins(0);
+    int completedPageCount = 0;
+    for (final sourceDocument in sourceDocumentList) {
+      for (int index = 0; index < sourceDocument.pages.count; index++) {
+        final sourcePage = sourceDocument.pages[index];
+        outputDocument.pageSettings.size = sourcePage.size;
+        final targetPage = outputDocument.pages.add();
+        targetPage.graphics.drawPdfTemplate(
+          sourcePage.createTemplate(),
+          Offset.zero,
+          sourcePage.size,
+        );
+        completedPageCount++;
+        sendPort.send(<String, dynamic>{
+          "type": "progress",
+          "value": completedPageCount / totalPageCount,
+        });
+      }
+    }
+    final outputFile = await _createSequentialOutputFile(
+      prefix: "Merge",
+      extension: "pdf",
+    );
+    final bytes = await outputDocument.save();
+    await outputFile.writeAsBytes(bytes, flush: true);
+    final stat = await outputFile.stat();
+    sendPort.send(<String, dynamic>{
+      "type": "result",
+      "fileInfo": _fileInfoToMap(
+        FileToolsFileInfo(
+          name: outputFile.uri.pathSegments.last,
+          type: FileToolsDocumentType.pdf,
+          updateTime: stat.modified.millisecondsSinceEpoch,
+          size: stat.size,
+          path: outputFile.path,
+        ),
+      ),
+    });
+  } catch (e) {
+    _sendTaskError(sendPort, e, fallbackMessage: "Failed to merge PDF files");
+  } finally {
+    for (final document in sourceDocumentList) {
+      document.dispose();
+    }
+    outputDocument?.dispose();
+  }
+}
+
+Future<void> _splitPdfFileIsolateEntry(Map<String, dynamic> message) async {
+  final sendPort = message["sendPort"] as SendPort;
+  PdfDocument? sourceDocument;
+  PdfDocument? outputDocument;
+  try {
+    final rawFileInfo = message["fileInfo"];
+    final rawPageIndexList =
+        message["selectedPageIndexList"] as List<dynamic>? ?? <dynamic>[];
+    if (rawFileInfo is! Map) {
+      throw Exception("File path is invalid");
+    }
+    final fileInfo = _fileInfoFromMap(Map<String, dynamic>.from(rawFileInfo));
+    final selectedPageIndexList = rawPageIndexList
+        .whereType<num>()
+        .map((item) => item.toInt())
+        .toList(growable: false);
+    if (selectedPageIndexList.isEmpty) {
+      throw Exception("Please select at least one page");
+    }
+    final path = fileInfo.path ?? "";
+    if (path.isEmpty) {
+      throw Exception("File path is invalid");
+    }
+    final file = File(path);
+    if (!await file.exists()) {
+      throw Exception("The file does not exist. Please select another file");
+    }
+    sourceDocument = PdfDocument(inputBytes: await file.readAsBytes());
+    final totalPageCount = sourceDocument.pages.count;
+    final normalizedPageIndexList = <int>[];
+    for (final index in selectedPageIndexList) {
+      if (index >= 0 && index < totalPageCount) {
+        normalizedPageIndexList.add(index);
+      }
+    }
+    if (normalizedPageIndexList.isEmpty) {
+      throw Exception("Please select at least one valid page");
+    }
+    outputDocument = PdfDocument();
+    outputDocument.pageSettings.setMargins(0);
+    for (int i = 0; i < normalizedPageIndexList.length; i++) {
+      final sourcePage = sourceDocument.pages[normalizedPageIndexList[i]];
+      outputDocument.pageSettings.size = sourcePage.size;
+      final targetPage = outputDocument.pages.add();
+      targetPage.graphics.drawPdfTemplate(
+        sourcePage.createTemplate(),
+        Offset.zero,
+        sourcePage.size,
+      );
+      _sendTaskProgress(sendPort, (i + 1) / normalizedPageIndexList.length);
+    }
+    final outputFile = await _createSequentialOutputFile(
+      prefix: "split",
+      extension: "pdf",
+    );
+    final bytes = await outputDocument.save();
+    await outputFile.writeAsBytes(bytes, flush: true);
+    final stat = await outputFile.stat();
+    _sendTaskResult(
+      sendPort,
+      FileToolsFileInfo(
+        name: outputFile.uri.pathSegments.last,
+        type: FileToolsDocumentType.pdf,
+        updateTime: stat.modified.millisecondsSinceEpoch,
+        size: stat.size,
+        path: outputFile.path,
+      ),
+    );
+  } catch (e) {
+    _sendTaskError(sendPort, e, fallbackMessage: "Failed to split PDF");
+  } finally {
+    sourceDocument?.dispose();
+    outputDocument?.dispose();
+  }
+}
+
+Future<void> _convertPdfToWordFileIsolateEntry(
+  Map<String, dynamic> message,
+) async {
+  final sendPort = message["sendPort"] as SendPort;
+  File? outputFile;
+  try {
+    final rawFileInfo = message["fileInfo"];
+    if (rawFileInfo is! Map) {
+      throw Exception("File path is invalid");
+    }
+    final fileInfo = _fileInfoFromMap(Map<String, dynamic>.from(rawFileInfo));
+    final path = fileInfo.path ?? "";
+    if (path.isEmpty) {
+      throw Exception("File path is invalid");
+    }
+    final sourceFile = File(path);
+    if (!await sourceFile.exists()) {
+      throw Exception("The file does not exist. Please select another file");
+    }
+    _sendTaskProgress(sendPort, 0.15);
+    outputFile = await _createSequentialOutputFile(
+      prefix: "pdf2word",
+      extension: "docx",
+    );
+    _sendTaskProgress(sendPort, 0.3);
+    await FlutterPreviewFile.convertPdfToWord(
+      inputPath: path,
+      outputPath: outputFile.path,
+    );
+    _sendTaskProgress(sendPort, 0.9);
+    final stat = await outputFile.stat();
+    _sendTaskResult(
+      sendPort,
+      FileToolsFileInfo(
+        name: outputFile.uri.pathSegments.last,
+        type: FileToolsDocumentType.word,
+        updateTime: stat.modified.millisecondsSinceEpoch,
+        size: stat.size,
+        path: outputFile.path,
+      ),
+    );
+  } catch (e) {
+    if (outputFile != null && await outputFile.exists()) {
+      await outputFile.delete();
+    }
+    _sendTaskError(
+      sendPort,
+      e,
+      fallbackMessage: "Failed to convert PDF to Word",
+    );
+  }
+}
+
+Future<void> _extractPdfTextFileIsolateEntry(
+  Map<String, dynamic> message,
+) async {
+  final sendPort = message["sendPort"] as SendPort;
+  File? outputFile;
+  try {
+    final rawFileInfo = message["fileInfo"];
+    final rawPageIndexList =
+        message["selectedPageIndexList"] as List<dynamic>? ?? <dynamic>[];
+    if (rawFileInfo is! Map) {
+      throw Exception("File path is invalid");
+    }
+    final fileInfo = _fileInfoFromMap(Map<String, dynamic>.from(rawFileInfo));
+    final selectedPageIndexList = rawPageIndexList
+        .whereType<num>()
+        .map((item) => item.toInt())
+        .toList(growable: false);
+    final path = fileInfo.path ?? "";
+    if (path.isEmpty) {
+      throw Exception("File path is invalid");
+    }
+    final sourceFile = File(path);
+    if (!await sourceFile.exists()) {
+      throw Exception("The file does not exist. Please select another file");
+    }
+    if (selectedPageIndexList.isEmpty) {
+      throw Exception("Please select at least one page");
+    }
+    outputFile = await _createSequentialOutputFile(
+      prefix: "ExtractText",
+      extension: "txt",
+    );
+    final text = await FlutterPreviewFile.extractPdfText(
+      inputPath: path,
+      selectedPageIndexList: selectedPageIndexList,
+      onProgress: (progress) {
+        _sendTaskProgress(sendPort, progress);
+      },
+    );
+    await outputFile.writeAsString(text, flush: true);
+    final stat = await outputFile.stat();
+    _sendTaskResult(
+      sendPort,
+      FileToolsFileInfo(
+        name: outputFile.uri.pathSegments.last,
+        type: FileToolsDocumentType.word,
+        updateTime: stat.modified.millisecondsSinceEpoch,
+        size: stat.size,
+        path: outputFile.path,
+      ),
+    );
+  } catch (e) {
+    if (outputFile != null && await outputFile.exists()) {
+      await outputFile.delete();
+    }
+    _sendTaskError(sendPort, e, fallbackMessage: "Failed to extract text");
+  }
+}
+
+Future<void> _generatePdfFromImagesIsolateEntry(
+  Map<String, dynamic> message,
+) async {
+  final sendPort = message["sendPort"] as SendPort;
+  PdfDocument? outputDocument;
+  try {
+    final rawImageList = message["imageList"] as List<dynamic>? ?? <dynamic>[];
+    final outputFileName = message["outputFileName"]?.toString();
+    final imageList = rawImageList
+        .whereType<Map>()
+        .map((item) => _fileInfoFromMap(Map<String, dynamic>.from(item)))
+        .toList(growable: false);
+    if (imageList.isEmpty) {
+      throw Exception("Please select at least one image");
+    }
+    outputDocument = PdfDocument();
+    outputDocument.pageSettings.setMargins(0);
+    final totalCount = imageList.length;
+    for (int index = 0; index < totalCount; index++) {
+      final bean = imageList[index];
+      final path = bean.path ?? "";
+      if (path.isEmpty) {
+        throw Exception("Image path is invalid");
+      }
+      final file = File(path);
+      if (!await file.exists()) {
+        throw Exception(
+          "The image does not exist. Please select another image",
+        );
+      }
+      final imageBytes = await file.readAsBytes();
+      final bitmap = PdfBitmap(imageBytes);
+      outputDocument.pageSettings
+        ..orientation = bitmap.width >= bitmap.height
+            ? PdfPageOrientation.landscape
+            : PdfPageOrientation.portrait
+        ..size = PdfPageSize.a4;
+      final page = outputDocument.pages.add();
+      final clientSize = page.getClientSize();
+      final imageWidth = bitmap.width.toDouble();
+      final imageHeight = bitmap.height.toDouble();
+      final scale = math.min(
+        clientSize.width / imageWidth,
+        clientSize.height / imageHeight,
+      );
+      final drawWidth = imageWidth * scale;
+      final drawHeight = imageHeight * scale;
+      page.graphics.drawImage(
+        bitmap,
+        Rect.fromLTWH(
+          (clientSize.width - drawWidth) / 2,
+          (clientSize.height - drawHeight) / 2,
+          drawWidth,
+          drawHeight,
+        ),
+      );
+      _sendTaskProgress(sendPort, (index + 1) / totalCount);
+    }
+    final outputFile = await _createImagesToPdfOutputFile(
+      outputFileName: outputFileName,
+    );
+    final bytes = await outputDocument.save();
+    await outputFile.writeAsBytes(bytes, flush: true);
+    final stat = await outputFile.stat();
+    _sendTaskResult(
+      sendPort,
+      FileToolsFileInfo(
+        name: outputFile.uri.pathSegments.last,
+        type: FileToolsDocumentType.pdf,
+        updateTime: stat.modified.millisecondsSinceEpoch,
+        size: stat.size,
+        path: outputFile.path,
+      ),
+    );
+  } catch (e) {
+    _sendTaskError(sendPort, e, fallbackMessage: "Failed to generate PDF");
+  } finally {
+    outputDocument?.dispose();
+  }
+}
+
+void _sendTaskProgress(SendPort sendPort, double progress) {
+  sendPort.send(<String, dynamic>{
+    "type": "progress",
+    "value": progress.clamp(0, 1),
+  });
+}
+
+void _sendTaskResult(SendPort sendPort, FileToolsFileInfo fileInfo) {
+  sendPort.send(<String, dynamic>{
+    "type": "result",
+    "fileInfo": _fileInfoToMap(fileInfo),
+  });
+}
+
+void _sendTaskError(
+  SendPort sendPort,
+  Object error, {
+  required String fallbackMessage,
+}) {
+  final message = error.toString().replaceFirst("Exception: ", "").trim();
+  sendPort.send(<String, dynamic>{
+    "type": "error",
+    "message": message.isEmpty ? fallbackMessage : message,
+  });
+}
+
+Map<String, dynamic> _fileInfoToMap(FileToolsFileInfo item) {
+  return <String, dynamic>{
+    "name": item.name,
+    "typeIndex": item.type?.index,
+    "updateTime": item.updateTime,
+    "size": item.size,
+    "path": item.path,
+    "bookmark": item.bookmark,
+  };
+}
+
+FileToolsFileInfo _fileInfoFromMap(Map<String, dynamic> item) {
+  final rawTypeIndex = item["typeIndex"];
+  return FileToolsFileInfo(
+    name: item["name"] as String?,
+    type: rawTypeIndex is int
+        ? FileToolsDocumentType.values[rawTypeIndex]
+        : null,
+    updateTime: item["updateTime"] as int?,
+    size: item["size"] as int?,
+    path: item["path"] as String?,
+    bookmark: item["bookmark"] as bool?,
+  );
 }
 
 class _PdfExtractTask {
