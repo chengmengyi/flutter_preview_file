@@ -8,6 +8,7 @@ import 'dart:ui' show Offset, Rect;
 import 'package:photo_manager/photo_manager.dart';
 
 import '../flutter_preview_file.dart';
+import 'word/word_to_pdf_converter.dart';
 
 typedef FileToolsProgressCallback = void Function(double progress);
 
@@ -207,6 +208,22 @@ class FileToolsService {
       throw Exception("The file does not exist. Please select another file");
     }
     onProgress?.call(0);
+    final canRunInBackground = await WordToPdfConverter.canConvertInBackground(
+      inputPath: path,
+    );
+    if (canRunInBackground) {
+      final result = await _runFileToolsTaskInBackground(
+        isolateEntry: _convertWordToPdfOoxmlIsolateEntry,
+        payload: <String, dynamic>{"fileInfo": _fileInfoToMap(fileInfo)},
+        fallbackErrorMessage: "Failed to convert Word to PDF",
+        onProgress: onProgress,
+        taskControl: taskControl,
+      );
+      await taskControl?.checkpoint();
+      await FlutterPreviewFile.scanFile(result.path ?? "");
+      onProgress?.call(1);
+      return result;
+    }
     await taskControl?.checkpoint();
     onProgress?.call(0.15);
     final outputFile = await _createSequentialOutputFile(
@@ -574,6 +591,59 @@ class FileToolsService {
       extension: "pdf",
     );
     return _queryFileBaseName(outputFile.uri.pathSegments.last);
+  }
+}
+
+Future<void> _convertWordToPdfOoxmlIsolateEntry(
+  Map<String, dynamic> message,
+) async {
+  final sendPort = message["sendPort"] as SendPort;
+  File? outputFile;
+  try {
+    final rawFileInfo = message["fileInfo"];
+    if (rawFileInfo is! Map) {
+      throw Exception("File path is invalid");
+    }
+    final fileInfo = _fileInfoFromMap(Map<String, dynamic>.from(rawFileInfo));
+    final path = fileInfo.path ?? "";
+    if (path.isEmpty) {
+      throw Exception("File path is invalid");
+    }
+    final sourceFile = File(path);
+    if (!await sourceFile.exists()) {
+      throw Exception("The file does not exist. Please select another file");
+    }
+    _sendTaskProgress(sendPort, 0.15);
+    outputFile = await _createSequentialOutputFile(
+      prefix: "word2pdf",
+      extension: "pdf",
+    );
+    _sendTaskProgress(sendPort, 0.3);
+    await WordToPdfConverter.convertOoxmlFileToPdf(
+      inputPath: path,
+      outputPath: outputFile.path,
+    );
+    _sendTaskProgress(sendPort, 0.9);
+    final stat = await outputFile.stat();
+    _sendTaskResult(
+      sendPort,
+      FileToolsFileInfo(
+        name: outputFile.uri.pathSegments.last,
+        type: FileToolsDocumentType.pdf,
+        updateTime: stat.modified.millisecondsSinceEpoch,
+        size: stat.size,
+        path: outputFile.path,
+      ),
+    );
+  } catch (e) {
+    if (outputFile != null && await outputFile.exists()) {
+      await outputFile.delete();
+    }
+    _sendTaskError(
+      sendPort,
+      e,
+      fallbackMessage: "Failed to convert Word to PDF",
+    );
   }
 }
 

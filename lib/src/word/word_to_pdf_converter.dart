@@ -36,6 +36,35 @@ class WordToPdfConverter {
     return result ?? outputPath;
   }
 
+  static Future<bool> canConvertInBackground({
+    required String inputPath,
+  }) async {
+    final file = File(inputPath);
+    if (!await file.exists()) {
+      return false;
+    }
+    final bytes = await file.readAsBytes();
+    return _isOoxmlFile(bytes);
+  }
+
+  static Future<String> convertOoxmlFileToPdf({
+    required String inputPath,
+    required String outputPath,
+  }) async {
+    final file = File(inputPath);
+    if (!await file.exists()) {
+      throw Exception('The source file is no longer available.');
+    }
+    final bytes = await file.readAsBytes();
+    if (!_isOoxmlFile(bytes)) {
+      throw Exception(
+        'Current Word file requires native html to pdf conversion.',
+      );
+    }
+    await _convertOoxmlToPdf(bytes: bytes, outputPath: outputPath);
+    return outputPath;
+  }
+
   static Future<String> loadWordHtml(String path) async {
     final extension = _queryExtension(path);
     if (extension != 'doc' && extension != 'docx') {

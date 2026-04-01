@@ -44,18 +44,22 @@ export 'src/word/word_file_view.dart';
 class FlutterPreviewFile {
   const FlutterPreviewFile._();
 
+  /// 获取当前平台版本信息。
   static Future<String?> getPlatformVersion() {
     return FlutterPreviewFilePlatform.instance.getPlatformVersion();
   }
 
+  /// 读取 Word 文档内容并返回解析结果。
   static Future<Map<String, dynamic>?> loadDocContent(String path) {
     return FlutterPreviewFilePlatform.instance.loadDocContent(path);
   }
 
+  /// 将 Word 文档转换成 HTML 字符串。
   static Future<String?> convertDocToHtml(String path) {
     return FlutterPreviewFilePlatform.instance.convertDocToHtml(path);
   }
 
+  /// 将 HTML 内容生成 PDF 文件。
   static Future<String?> convertHtmlToPdf({
     required String html,
     required String outputPath,
@@ -66,6 +70,7 @@ class FlutterPreviewFile {
     );
   }
 
+  /// 将 Word 文件转换成 PDF 文件。
   static Future<String> convertWordToPdf({
     required String inputPath,
     required String outputPath,
@@ -76,6 +81,7 @@ class FlutterPreviewFile {
     );
   }
 
+  /// 将 PDF 文件转换成 Word 文件。
   static Future<String> convertPdfToWord({
     required String inputPath,
     required String outputPath,
@@ -90,6 +96,7 @@ class FlutterPreviewFile {
     );
   }
 
+  /// 提取 PDF 中的文字内容。
   static Future<String> extractPdfText({
     required String inputPath,
     List<int>? selectedPageIndexList,
@@ -102,6 +109,7 @@ class FlutterPreviewFile {
     );
   }
 
+  /// 保存 Word 文档的文本内容。
   static Future<bool> saveDocTextContent({
     required String path,
     required String text,
@@ -112,14 +120,17 @@ class FlutterPreviewFile {
     );
   }
 
+  /// 触发系统扫描文件。
   static Future<void> scanFile(String path) {
     return FlutterPreviewFilePlatform.instance.scanFile(path);
   }
 
+  /// 获取 PDF 的总页数。
   static Future<int> getPdfPageCount(String path) {
     return FlutterPreviewFilePlatform.instance.getPdfPageCount(path);
   }
 
+  /// 将 PDF 指定页渲染成图片文件。
   static Future<String?> renderPdfPageToImage({
     required String pdfPath,
     required int pageIndex,
@@ -134,6 +145,7 @@ class FlutterPreviewFile {
     );
   }
 
+  /// 将 PDF 指定页渲染成图片字节数据。
   static Future<Uint8List?> renderPdfPageToImageBytes({
     required String pdfPath,
     required int pageIndex,
@@ -146,16 +158,19 @@ class FlutterPreviewFile {
     );
   }
 
+  /// 按类型查询文件列表。
   static Future<List<FileToolsFileInfo>> queryFileList(
     FileToolsDocumentType type,
   ) {
     return FileToolsService.instance.queryFileList(type);
   }
 
+  /// 根据路径匹配文件类型。
   static FileToolsDocumentType? matchDocumentsType(String path) {
     return FileToolsService.instance.matchDocumentsType(path);
   }
 
+  /// 重命名文件。
   static Future<FileToolsFileInfo?> renameFile({
     required FileToolsFileInfo fileInfo,
     required String newNameWithoutExtension,
@@ -166,14 +181,17 @@ class FlutterPreviewFile {
     );
   }
 
+  /// 删除指定文件。
   static Future<bool> deleteFile(String path) {
     return FileToolsService.instance.deleteFile(path);
   }
 
+  /// 判断文件是否存在。
   static Future<bool> fileExists(String path) {
     return FileToolsService.instance.fileExists(path);
   }
 
+  /// 按指定规则排序文件列表。
   static List<FileToolsFileInfo> sortFileList(
     List<FileToolsFileInfo> fileList,
     FileToolsSortType sortType,
@@ -181,6 +199,7 @@ class FlutterPreviewFile {
     return FileToolsService.instance.sortFileList(fileList, sortType);
   }
 
+  /// 合并多个 PDF 文件。
   static Future<FileToolsFileInfo> mergePdfFiles({
     required List<FileToolsFileInfo> fileList,
     FileToolsProgressCallback? onProgress,
@@ -193,6 +212,7 @@ class FlutterPreviewFile {
     );
   }
 
+  /// 拆分 PDF 文件。
   static Future<FileToolsFileInfo> splitPdfFile({
     required FileToolsFileInfo fileInfo,
     required List<int> selectedPageIndexList,
@@ -207,6 +227,7 @@ class FlutterPreviewFile {
     );
   }
 
+  /// 将文件信息对应的 Word 文件转成 PDF。
   static Future<FileToolsFileInfo> convertWordToPdfFile({
     required FileToolsFileInfo fileInfo,
     FileToolsProgressCallback? onProgress,
@@ -219,6 +240,7 @@ class FlutterPreviewFile {
     );
   }
 
+  /// 将文件信息对应的 PDF 文件转成 Word。
   static Future<FileToolsFileInfo> convertPdfToWordFile({
     required FileToolsFileInfo fileInfo,
     FileToolsProgressCallback? onProgress,
@@ -231,6 +253,7 @@ class FlutterPreviewFile {
     );
   }
 
+  /// 提取 PDF 指定页的文字并生成文件。
   static Future<FileToolsFileInfo> extractPdfTextFile({
     required FileToolsFileInfo fileInfo,
     required List<int> selectedPageIndexList,
@@ -245,10 +268,12 @@ class FlutterPreviewFile {
     );
   }
 
+  /// 查询设备中的所有图片文件。
   static Future<List<FileToolsFileInfo>> queryAllImages() {
     return FileToolsService.instance.queryAllImages();
   }
 
+  /// 将多张图片生成一个 PDF 文件。
   static Future<FileToolsFileInfo> generatePdfFromImages({
     required List<FileToolsFileInfo> imageList,
     String? outputFileName,
@@ -263,6 +288,7 @@ class FlutterPreviewFile {
     );
   }
 
+  /// 将 PDF 页面导出为图片并打包成 zip。
   static Future<FileToolsPdfToImagesZipResult> extractPdfToImagesZip({
     required List<FileToolsFileInfo> fileList,
     FileToolsProgressCallback? onProgress,
@@ -275,6 +301,7 @@ class FlutterPreviewFile {
     );
   }
 
+  /// 将 PDF 页面图片保存到系统相册。
   static Future<int> savePdfImagesToGallery({
     required List<FileToolsFileInfo> fileList,
     FileToolsProgressCallback? onProgress,
@@ -285,6 +312,7 @@ class FlutterPreviewFile {
     );
   }
 
+  /// 获取 PDF 指定页的图片数据。
   static Future<Uint8List?> queryPdfImage({
     required FileToolsFileInfo fileInfo,
     required int pageIndex,
@@ -297,6 +325,7 @@ class FlutterPreviewFile {
     );
   }
 
+  /// 获取下一个扫描 PDF 的默认名称。
   static Future<String> queryNextScanPdfName() {
     return FileToolsService.instance.queryNextScanPdfName();
   }
