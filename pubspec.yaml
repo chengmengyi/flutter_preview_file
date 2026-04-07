@@ -1,6 +1,6 @@
 name: flutter_preview_file
 description: "Reusable preview and edit widgets for PDF, Word, and Excel files."
-version: 0.0.3
+version: 0.0.4
 homepage: https://github.com/chengmengyi/flutter_preview_file
 
 environment:
