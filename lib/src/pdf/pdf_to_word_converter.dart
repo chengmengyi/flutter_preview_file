@@ -1,5 +1,6 @@
 import 'dart:convert';
 import 'dart:io';
+import 'dart:typed_data';
 
 import 'package:archive/archive.dart';
 import 'package:syncfusion_flutter_pdf/pdf.dart';
@@ -51,6 +52,7 @@ class PdfToWordConverter {
     required String outputPath,
     List<int>? selectedPageIndexList,
     void Function(double progress)? onProgress,
+    List<Uint8List?>? pageImageBytesList,
   }) async {
     final text = await extractText(
       inputPath: inputPath,
@@ -59,7 +61,10 @@ class PdfToWordConverter {
     );
     final pageTextList = text.isEmpty ? <String>[''] : text.split('\n\n');
     {
-      final docxBytes = _buildDocxBytes(pageTextList);
+      final docxBytes = _buildDocxBytes(
+        pageTextList,
+        pageImageBytesList: pageImageBytesList,
+      );
       final outputFile = File(outputPath);
       await outputFile.parent.create(recursive: true);
       await outputFile.writeAsBytes(docxBytes, flush: true);
@@ -95,12 +100,16 @@ class PdfToWordConverter {
         .trimRight();
   }
 
-  static List<int> _buildDocxBytes(List<String> pageTextList) {
+  static List<int> _buildDocxBytes(
+    List<String> pageTextList, {
+    List<Uint8List?>? pageImageBytesList,
+  }) {
     final archive = Archive();
-    final documentXml = _buildDocumentXml(pageTextList);
-    final contentTypesXml = _buildContentTypesXml();
+    final imageList = _buildDocxImageList(pageImageBytesList);
+    final documentXml = _buildDocumentXml(pageTextList, imageList);
+    final contentTypesXml = _buildContentTypesXml(imageList);
     final relsXml = _buildRootRelsXml();
-    final documentRelsXml = _buildDocumentRelsXml();
+    final documentRelsXml = _buildDocumentRelsXml(imageList);
     final appXml = _buildAppXml(pageTextList.length);
     final coreXml = _buildCoreXml();
 
@@ -117,10 +126,46 @@ class PdfToWordConverter {
       final data = utf8.encode(entry.value);
       archive.addFile(ArchiveFile(entry.key, data.length, data));
     }
+    for (final image in imageList) {
+      archive.addFile(
+        ArchiveFile(image.path, image.bytes.length, image.bytes),
+      );
+    }
     return ZipEncoder().encode(archive) ?? <int>[];
   }
 
-  static String _buildDocumentXml(List<String> pageTextList) {
+  static List<_DocxImage> _buildDocxImageList(
+      List<Uint8List?>? pageImageBytesList) {
+    if (pageImageBytesList == null || pageImageBytesList.isEmpty) {
+      return const <_DocxImage>[];
+    }
+    final result = <_DocxImage>[];
+    for (int pageIndex = 0;
+        pageIndex < pageImageBytesList.length;
+        pageIndex++) {
+      final bytes = pageImageBytesList[pageIndex];
+      if (bytes == null || bytes.isEmpty) {
+        continue;
+      }
+      final imageIndex = result.length + 1;
+      result.add(
+        _DocxImage(
+          pageIndex: pageIndex,
+          relationshipId: 'rIdImage$imageIndex',
+          path:
+              'word/media/pdf_page_${imageIndex.toString().padLeft(3, '0')}.png',
+          target: 'media/pdf_page_${imageIndex.toString().padLeft(3, '0')}.png',
+          bytes: bytes,
+        ),
+      );
+    }
+    return result;
+  }
+
+  static String _buildDocumentXml(
+    List<String> pageTextList,
+    List<_DocxImage> imageList,
+  ) {
     final contentBuffer = StringBuffer();
     for (int pageIndex = 0; pageIndex < pageTextList.length; pageIndex++) {
       final pageText = pageTextList[pageIndex];
@@ -134,6 +179,10 @@ class PdfToWordConverter {
         contentBuffer.write(
           '<w:p><w:r><w:t xml:space="preserve">$escapedText</w:t></w:r></w:p>',
         );
+      }
+      for (final image
+          in imageList.where((item) => item.pageIndex == pageIndex)) {
+        contentBuffer.write(_buildImageParagraphXml(image));
       }
       if (pageIndex != pageTextList.length - 1) {
         contentBuffer.write(
@@ -170,12 +219,57 @@ class PdfToWordConverter {
 </w:document>''';
   }
 
-  static String _buildContentTypesXml() {
+  static String _buildImageParagraphXml(_DocxImage image) {
+    const int cx = 5486400;
+    const int cy = 7750000;
+    final docPrId = image.pageIndex + 1;
+    return '''
+<w:p>
+  <w:r>
+    <w:drawing>
+      <wp:inline distT="0" distB="0" distL="0" distR="0">
+        <wp:extent cx="$cx" cy="$cy"/>
+        <wp:effectExtent l="0" t="0" r="0" b="0"/>
+        <wp:docPr id="$docPrId" name="PDF Page ${image.pageIndex + 1}"/>
+        <wp:cNvGraphicFramePr>
+          <a:graphicFrameLocks xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" noChangeAspect="1"/>
+        </wp:cNvGraphicFramePr>
+        <a:graphic xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main">
+          <a:graphicData uri="http://schemas.openxmlformats.org/drawingml/2006/picture">
+            <pic:pic xmlns:pic="http://schemas.openxmlformats.org/drawingml/2006/picture">
+              <pic:nvPicPr>
+                <pic:cNvPr id="$docPrId" name="PDF Page ${image.pageIndex + 1}"/>
+                <pic:cNvPicPr/>
+              </pic:nvPicPr>
+              <pic:blipFill>
+                <a:blip r:embed="${image.relationshipId}"/>
+                <a:stretch><a:fillRect/></a:stretch>
+              </pic:blipFill>
+              <pic:spPr>
+                <a:xfrm>
+                  <a:off x="0" y="0"/>
+                  <a:ext cx="$cx" cy="$cy"/>
+                </a:xfrm>
+                <a:prstGeom prst="rect"><a:avLst/></a:prstGeom>
+              </pic:spPr>
+            </pic:pic>
+          </a:graphicData>
+        </a:graphic>
+      </wp:inline>
+    </w:drawing>
+  </w:r>
+</w:p>''';
+  }
+
+  static String _buildContentTypesXml(List<_DocxImage> imageList) {
+    final imageDefaults = imageList.isEmpty
+        ? ''
+        : '  <Default Extension="png" ContentType="image/png"/>\n';
     return '''<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">
   <Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>
   <Default Extension="xml" ContentType="application/xml"/>
-  <Override PartName="/docProps/app.xml" ContentType="application/vnd.openxmlformats-officedocument.extended-properties+xml"/>
+$imageDefaults  <Override PartName="/docProps/app.xml" ContentType="application/vnd.openxmlformats-officedocument.extended-properties+xml"/>
   <Override PartName="/docProps/core.xml" ContentType="application/vnd.openxmlformats-package.core-properties+xml"/>
   <Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/>
 </Types>''';
@@ -190,9 +284,14 @@ class PdfToWordConverter {
 </Relationships>''';
   }
 
-  static String _buildDocumentRelsXml() {
+  static String _buildDocumentRelsXml(List<_DocxImage> imageList) {
+    final imageRels = imageList.map((image) {
+      return '  <Relationship Id="${image.relationshipId}" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/image" Target="${image.target}"/>';
+    }).join('\n');
     return '''<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
-<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"></Relationships>''';
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+$imageRels
+</Relationships>''';
   }
 
   static String _buildAppXml(int pageCount) {
@@ -228,4 +327,20 @@ class PdfToWordConverter {
         .replaceAll('"', '&quot;')
         .replaceAll("'", '&apos;');
   }
+}
+
+class _DocxImage {
+  const _DocxImage({
+    required this.pageIndex,
+    required this.relationshipId,
+    required this.path,
+    required this.target,
+    required this.bytes,
+  });
+
+  final int pageIndex;
+  final String relationshipId;
+  final String path;
+  final String target;
+  final Uint8List bytes;
 }

@@ -8,6 +8,7 @@ import 'dart:ui' show Offset, Rect;
 import 'package:photo_manager/photo_manager.dart';
 
 import '../flutter_preview_file.dart';
+import 'pdf/pdf_to_word_converter.dart';
 import 'word/word_to_pdf_converter.dart';
 
 typedef FileToolsProgressCallback = void Function(double progress);
@@ -68,9 +69,8 @@ class FileToolsService {
       return null;
     }
     final extension = _queryFileExtension(fileInfo.name ?? oldPath);
-    final targetName = extension.isEmpty
-        ? targetBaseName
-        : "$targetBaseName.$extension";
+    final targetName =
+        extension.isEmpty ? targetBaseName : "$targetBaseName.$extension";
     final targetPath = "${oldFile.parent.path}/$targetName";
     if (targetPath == oldPath) {
       final stat = await oldFile.stat();
@@ -125,15 +125,15 @@ class FileToolsService {
       case FileToolsSortType.az:
         result.sort(
           (a, b) => (a.name ?? "").toLowerCase().compareTo(
-            (b.name ?? "").toLowerCase(),
-          ),
+                (b.name ?? "").toLowerCase(),
+              ),
         );
         break;
       case FileToolsSortType.za:
         result.sort(
           (a, b) => (b.name ?? "").toLowerCase().compareTo(
-            (a.name ?? "").toLowerCase(),
-          ),
+                (a.name ?? "").toLowerCase(),
+              ),
         );
         break;
     }
@@ -271,17 +271,62 @@ class FileToolsService {
       throw Exception("The file does not exist. Please select another file");
     }
     onProgress?.call(0);
-    final result = await _runFileToolsTaskInBackground(
-      isolateEntry: _convertPdfToWordFileIsolateEntry,
-      payload: <String, dynamic>{"fileInfo": _fileInfoToMap(fileInfo)},
-      fallbackErrorMessage: "Failed to convert PDF to Word",
-      onProgress: onProgress,
-      taskControl: taskControl,
-    );
     await taskControl?.checkpoint();
-    await FlutterPreviewFile.scanFile(result.path ?? "");
-    onProgress?.call(1);
-    return result;
+    final outputFile = await _createSequentialOutputFile(
+      prefix: "pdf2word",
+      extension: "docx",
+    );
+    onProgress?.call(0.2);
+    try {
+      final List<Uint8List?> pageImageBytesList = <Uint8List?>[];
+      if (await _pdfMightContainImages(sourceFile)) {
+        final int pageCount = await FlutterPreviewFile.getPdfPageCount(path);
+        for (int pageIndex = 0; pageIndex < pageCount; pageIndex++) {
+          await taskControl?.checkpoint();
+          final Uint8List? pageImageBytes =
+              await FlutterPreviewFile.renderPdfPageToImageBytes(
+            pdfPath: path,
+            pageIndex: pageIndex,
+            width: 1200,
+          );
+          pageImageBytesList.add(pageImageBytes);
+          onProgress?.call(0.2 + ((pageIndex + 1) / pageCount) * 0.35);
+        }
+      }
+      await taskControl?.checkpoint();
+      await PdfToWordConverter.convert(
+        inputPath: path,
+        outputPath: outputFile.path,
+        pageImageBytesList:
+            pageImageBytesList.isEmpty ? null : pageImageBytesList,
+        onProgress: (double progress) {
+          onProgress?.call(0.55 + progress * 0.35);
+        },
+      );
+      await taskControl?.checkpoint();
+      await FlutterPreviewFile.scanFile(outputFile.path);
+      final stat = await outputFile.stat();
+      onProgress?.call(1);
+      return FileToolsFileInfo(
+        name: outputFile.uri.pathSegments.last,
+        type: FileToolsDocumentType.word,
+        updateTime: stat.modified.millisecondsSinceEpoch,
+        size: stat.size,
+        path: outputFile.path,
+      );
+    } catch (_) {
+      if (await outputFile.exists()) {
+        await outputFile.delete();
+      }
+      rethrow;
+    }
+  }
+
+  Future<bool> _pdfMightContainImages(File file) async {
+    final bytes = await file.readAsBytes();
+    final content = String.fromCharCodes(bytes, 0, bytes.length);
+    return content.contains('/Subtype/Image') ||
+        content.contains('/Subtype /Image');
   }
 
   Future<FileToolsFileInfo> extractPdfTextFile({
@@ -1196,59 +1241,6 @@ Future<void> _splitPdfFileIsolateEntry(Map<String, dynamic> message) async {
   }
 }
 
-Future<void> _convertPdfToWordFileIsolateEntry(
-  Map<String, dynamic> message,
-) async {
-  final sendPort = message["sendPort"] as SendPort;
-  File? outputFile;
-  try {
-    final rawFileInfo = message["fileInfo"];
-    if (rawFileInfo is! Map) {
-      throw Exception("File path is invalid");
-    }
-    final fileInfo = _fileInfoFromMap(Map<String, dynamic>.from(rawFileInfo));
-    final path = fileInfo.path ?? "";
-    if (path.isEmpty) {
-      throw Exception("File path is invalid");
-    }
-    final sourceFile = File(path);
-    if (!await sourceFile.exists()) {
-      throw Exception("The file does not exist. Please select another file");
-    }
-    _sendTaskProgress(sendPort, 0.15);
-    outputFile = await _createSequentialOutputFile(
-      prefix: "pdf2word",
-      extension: "docx",
-    );
-    _sendTaskProgress(sendPort, 0.3);
-    await FlutterPreviewFile.convertPdfToWord(
-      inputPath: path,
-      outputPath: outputFile.path,
-    );
-    _sendTaskProgress(sendPort, 0.9);
-    final stat = await outputFile.stat();
-    _sendTaskResult(
-      sendPort,
-      FileToolsFileInfo(
-        name: outputFile.uri.pathSegments.last,
-        type: FileToolsDocumentType.word,
-        updateTime: stat.modified.millisecondsSinceEpoch,
-        size: stat.size,
-        path: outputFile.path,
-      ),
-    );
-  } catch (e) {
-    if (outputFile != null && await outputFile.exists()) {
-      await outputFile.delete();
-    }
-    _sendTaskError(
-      sendPort,
-      e,
-      fallbackMessage: "Failed to convert PDF to Word",
-    );
-  }
-}
-
 Future<void> _extractPdfTextFileIsolateEntry(
   Map<String, dynamic> message,
 ) async {
@@ -1430,9 +1422,8 @@ FileToolsFileInfo _fileInfoFromMap(Map<String, dynamic> item) {
   final rawTypeIndex = item["typeIndex"];
   return FileToolsFileInfo(
     name: item["name"] as String?,
-    type: rawTypeIndex is int
-        ? FileToolsDocumentType.values[rawTypeIndex]
-        : null,
+    type:
+        rawTypeIndex is int ? FileToolsDocumentType.values[rawTypeIndex] : null,
     updateTime: item["updateTime"] as int?,
     size: item["size"] as int?,
     path: item["path"] as String?,
