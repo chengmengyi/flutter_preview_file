@@ -125,6 +125,19 @@ class FlutterPreviewFile {
     return FlutterPreviewFilePlatform.instance.scanFile(path);
   }
 
+  /// 将图片文件保存到系统相册。
+  static Future<bool> saveImageToGallery({
+    required String sourcePath,
+    required String displayName,
+    String? relativePath,
+  }) {
+    return FlutterPreviewFilePlatform.instance.saveImageToGallery(
+      sourcePath: sourcePath,
+      displayName: displayName,
+      relativePath: relativePath,
+    );
+  }
+
   /// 获取 PDF 的总页数。
   static Future<int> getPdfPageCount(String path) {
     return FlutterPreviewFilePlatform.instance.getPdfPageCount(path);

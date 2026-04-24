@@ -1,8 +1,8 @@
 import 'dart:convert';
 import 'dart:io';
-import 'dart:typed_data';
 
 import 'package:archive/archive.dart';
+import 'package:flutter/foundation.dart';
 import 'package:pdf/pdf.dart';
 import 'package:pdf/widgets.dart' as pw;
 import 'package:printing/printing.dart';
@@ -51,6 +51,9 @@ class WordToPdfConverter {
     required String inputPath,
     required String outputPath,
   }) async {
+    debugPrint(
+      'WordToPdf convertOoxmlFileToPdf start input=$inputPath output=$outputPath',
+    );
     final file = File(inputPath);
     if (!await file.exists()) {
       throw Exception('The source file is no longer available.');
@@ -62,6 +65,7 @@ class WordToPdfConverter {
       );
     }
     await _convertOoxmlToPdf(bytes: bytes, outputPath: outputPath);
+    debugPrint('WordToPdf convertOoxmlFileToPdf done output=$outputPath');
     return outputPath;
   }
 
@@ -95,17 +99,26 @@ class WordToPdfConverter {
     required List<int> bytes,
     required String outputPath,
   }) async {
+    debugPrint('WordToPdf _convertOoxmlToPdf decode zip start bytes=${bytes.length}');
     final archive = ZipDecoder().decodeBytes(bytes);
     final documentFile = archive.findFile('word/document.xml');
     if (documentFile == null) {
       throw Exception('word/document.xml not found');
     }
+    final imageBytesMap = _buildOoxmlImageBytesMap(archive);
+    debugPrint(
+      'WordToPdf _convertOoxmlToPdf document.xml found size=${(documentFile.content as List<int>).length}',
+    );
     final documentXml = XmlDocument.parse(
       utf8.decode(documentFile.content as List<int>),
     );
-    final blockList = _buildOoxmlBlockList(documentXml);
+    debugPrint('WordToPdf _convertOoxmlToPdf xml parsed');
+    final blockList = _buildOoxmlBlockList(documentXml, imageBytesMap);
+    debugPrint('WordToPdf _convertOoxmlToPdf blockList count=${blockList.length}');
     final document = pw.Document();
+    debugPrint('WordToPdf _convertOoxmlToPdf load font start');
     final font = await _loadPdfFont();
+    debugPrint('WordToPdf _convertOoxmlToPdf load font done hasFont=${font != null}');
     final theme = font == null
         ? null
         : pw.ThemeData.withFont(
@@ -125,30 +138,49 @@ class WordToPdfConverter {
         build: (context) => _buildPdfWidgetList(blockList),
       ),
     );
+    debugPrint('WordToPdf _convertOoxmlToPdf addPage done');
 
     final outputFile = File(outputPath);
     await outputFile.parent.create(recursive: true);
+    debugPrint('WordToPdf _convertOoxmlToPdf save start');
     await outputFile.writeAsBytes(await document.save(), flush: true);
+    debugPrint('WordToPdf _convertOoxmlToPdf save done path=$outputPath');
   }
 
   static Future<pw.Font?> _loadPdfFont() async {
-    try {
-      return await PdfGoogleFonts.notoSansSCRegular();
-    } catch (_) {}
-
-    const candidatePathList = <String>['/system/fonts/DroidSansFallback.ttf'];
+    const candidatePathList = <String>[
+      '/system/fonts/NotoSansSC-Regular.otf',
+      '/system/fonts/DroidSansFallback.ttf',
+      '/System/Library/Fonts/PingFang.ttc',
+      '/System/Library/Fonts/Hiragino Sans GB.ttc',
+      '/System/Library/Fonts/STHeiti Light.ttc',
+      '/System/Library/Fonts/STHeiti Medium.ttc',
+    ];
     for (final path in candidatePathList) {
+      if (path.toLowerCase().endsWith('.ttc')) {
+        debugPrint('WordToPdf _loadPdfFont skip collection font path=$path');
+        continue;
+      }
       final file = File(path);
       if (!await file.exists()) {
         continue;
       }
       try {
         final bytes = await file.readAsBytes();
+        debugPrint('WordToPdf _loadPdfFont use local path=$path');
         return pw.Font.ttf(ByteData.sublistView(bytes));
       } catch (_) {
         continue;
       }
     }
+
+    try {
+      debugPrint('WordToPdf _loadPdfFont use google font');
+      return await PdfGoogleFonts.notoSansSCRegular().timeout(
+        const Duration(seconds: 3),
+      );
+    } catch (_) {}
+
     return null;
   }
 
@@ -163,6 +195,9 @@ class WordToPdfConverter {
           break;
         case _WordParagraphBlock():
           widgetList.add(_buildParagraphWidget(block));
+          break;
+        case _WordImageBlock():
+          widgetList.add(_buildImageWidget(block));
           break;
         case _WordTableBlock():
           widgetList.add(_buildTableWidget(block));
@@ -208,7 +243,7 @@ class WordToPdfConverter {
     final content = block.isList
         ? pw.Row(
             crossAxisAlignment: pw.CrossAxisAlignment.start,
-            children: [
+            children: <pw.Widget>[
               pw.Padding(
                 padding: const pw.EdgeInsets.only(top: 1),
                 child: pw.Text('•', style: pw.TextStyle(fontSize: fontSize)),
@@ -221,6 +256,23 @@ class WordToPdfConverter {
     return pw.Padding(
       padding: const pw.EdgeInsets.only(bottom: 10),
       child: content,
+    );
+  }
+
+  static pw.Widget _buildImageWidget(_WordImageBlock block) {
+    final imageProvider = pw.MemoryImage(block.bytes);
+    final double width = block.widthPt == null
+        ? 220
+        : block.widthPt!.clamp(48, 420).toDouble();
+    final double? height = block.heightPt?.clamp(32, 420).toDouble();
+    return pw.Padding(
+      padding: const pw.EdgeInsets.only(top: 4, bottom: 12),
+      child: pw.Image(
+        imageProvider,
+        width: width,
+        height: height,
+        fit: pw.BoxFit.contain,
+      ),
     );
   }
 
@@ -238,7 +290,7 @@ class WordToPdfConverter {
                 child: pw.Column(
                   crossAxisAlignment: pw.CrossAxisAlignment.start,
                   children: cell.isEmpty
-                      ? [pw.SizedBox(height: 14)]
+                      ? <pw.Widget>[pw.SizedBox(height: 14)]
                       : cell.map(_buildTableParagraphWidget).toList(),
                 ),
               );
@@ -279,7 +331,10 @@ class WordToPdfConverter {
     );
   }
 
-  static List<_WordBlock> _buildOoxmlBlockList(XmlDocument documentXml) {
+  static List<_WordBlock> _buildOoxmlBlockList(
+    XmlDocument documentXml,
+    Map<String, Uint8List> imageBytesMap,
+  ) {
     final body = documentXml.findAllElements('w:body').firstOrNull;
     if (body == null) {
       return <_WordBlock>[];
@@ -294,9 +349,9 @@ class WordToPdfConverter {
           blockList.add(const _WordPageBreakBlock());
           continue;
         }
-        blockList.add(_parseParagraphBlock(node));
+        blockList.addAll(_parseParagraphBlocks(node, imageBytesMap));
       } else if (node.name.qualified == 'w:tbl') {
-        blockList.add(_parseTableBlock(node));
+        blockList.add(_parseTableBlock(node, imageBytesMap));
       }
     }
     while (blockList.isNotEmpty && blockList.last is _WordPageBreakBlock) {
@@ -305,15 +360,38 @@ class WordToPdfConverter {
     return blockList;
   }
 
-  static _WordParagraphBlock _parseParagraphBlock(XmlElement paragraph) {
+  static List<_WordBlock> _parseParagraphBlocks(
+    XmlElement paragraph,
+    Map<String, Uint8List> imageBytesMap,
+  ) {
+    final blockList = <_WordBlock>[];
     final spanList = <_WordSpan>[];
+    final bool isList = paragraph.findAllElements('w:numPr').isNotEmpty;
+    final String headingTag = _queryHeadingTag(paragraph);
+
+    void flushParagraph() {
+      if (spanList.isEmpty) {
+        return;
+      }
+      blockList.add(
+        _WordParagraphBlock(
+          spanList: List<_WordSpan>.from(spanList),
+          isList: isList,
+          headingTag: headingTag,
+        ),
+      );
+      spanList.clear();
+    }
+
     for (final run in paragraph.findElements('w:r')) {
       final runProp = run.getElement('w:rPr');
-      final bold = runProp?.getElement('w:b') != null;
-      final italic = runProp?.getElement('w:i') != null;
-      final underline = runProp?.getElement('w:u') != null;
+      final bool bold = runProp?.getElement('w:b') != null;
+      final bool italic = runProp?.getElement('w:i') != null;
+      final bool underline = runProp?.getElement('w:u') != null;
+
       for (final br in run.findElements('w:br')) {
-        final type = br.getAttribute('w:type') ?? br.getAttribute('type') ?? '';
+        final String type =
+            br.getAttribute('w:type') ?? br.getAttribute('type') ?? '';
         if (type != 'page') {
           spanList.add(
             const _WordSpan(
@@ -325,33 +403,56 @@ class WordToPdfConverter {
           );
         }
       }
-      final text = run
+
+      final String text = run
           .findAllElements('w:t')
           .map((element) => element.innerText)
           .join();
-      if (text.isEmpty) {
-        continue;
+      if (text.isNotEmpty) {
+        spanList.add(
+          _WordSpan(
+            text: text,
+            bold: bold,
+            italic: italic,
+            underline: underline,
+          ),
+        );
       }
-      spanList.add(
-        _WordSpan(text: text, bold: bold, italic: italic, underline: underline),
+
+      final _WordImageBlock? imageBlock = _parseRunImageBlock(run, imageBytesMap);
+      if (imageBlock != null) {
+        flushParagraph();
+        blockList.add(imageBlock);
+      }
+    }
+
+    flushParagraph();
+    if (blockList.isEmpty) {
+      blockList.add(
+        _WordParagraphBlock(
+          spanList: const <_WordSpan>[],
+          isList: isList,
+          headingTag: headingTag,
+        ),
       );
     }
-    return _WordParagraphBlock(
-      spanList: spanList,
-      isList: paragraph.findAllElements('w:numPr').isNotEmpty,
-      headingTag: _queryHeadingTag(paragraph),
-    );
+    return blockList;
   }
 
-  static _WordTableBlock _parseTableBlock(XmlElement table) {
+  static _WordTableBlock _parseTableBlock(
+    XmlElement table,
+    Map<String, Uint8List> imageBytesMap,
+  ) {
     final rowList = <List<List<_WordParagraphBlock>>>[];
     for (final row in table.findElements('w:tr')) {
       final cellList = <List<_WordParagraphBlock>>[];
       for (final cell in row.findElements('w:tc')) {
-        final paragraphList = cell
-            .findElements('w:p')
-            .map(_parseParagraphBlock)
-            .toList();
+        final paragraphList = cell.findElements('w:p').expand((paragraph) {
+          return _parseParagraphBlocks(
+            paragraph,
+            imageBytesMap,
+          ).whereType<_WordParagraphBlock>();
+        }).toList();
         cellList.add(paragraphList);
       }
       rowList.add(cellList);
@@ -365,10 +466,11 @@ class WordToPdfConverter {
     if (documentFile == null) {
       throw Exception('word/document.xml not found');
     }
+    final imageBytesMap = _buildOoxmlImageBytesMap(archive);
     final documentXml = XmlDocument.parse(
       utf8.decode(documentFile.content as List<int>),
     );
-    final blockList = _buildOoxmlBlockList(documentXml);
+    final blockList = _buildOoxmlBlockList(documentXml, imageBytesMap);
     final pageHtmlList = <StringBuffer>[StringBuffer()];
 
     StringBuffer currentPageBuffer() => pageHtmlList.last;
@@ -410,8 +512,12 @@ class WordToPdfConverter {
               '<${block.headingTag}>$richText</${block.headingTag}>',
             );
           }
+          break;
+        case _WordImageBlock():
+          continue;
         case _WordTableBlock():
           currentPageBuffer().writeln(_buildTableHtml(block));
+          break;
       }
     }
 
@@ -460,7 +566,8 @@ class WordToPdfConverter {
   static bool _paragraphHasPageBreak(XmlElement paragraph) {
     for (final run in paragraph.findElements('w:r')) {
       for (final br in run.findElements('w:br')) {
-        final type = br.getAttribute('w:type') ?? br.getAttribute('type') ?? '';
+        final String type =
+            br.getAttribute('w:type') ?? br.getAttribute('type') ?? '';
         if (type == 'page') {
           return true;
         }
@@ -493,6 +600,84 @@ class WordToPdfConverter {
       return 'h2';
     }
     return 'p';
+  }
+
+  static Map<String, Uint8List> _buildOoxmlImageBytesMap(Archive archive) {
+    final relsFile = archive.findFile('word/_rels/document.xml.rels');
+    if (relsFile == null) {
+      return const <String, Uint8List>{};
+    }
+    final relsXml = XmlDocument.parse(
+      utf8.decode(relsFile.content as List<int>),
+    );
+    final imageBytesMap = <String, Uint8List>{};
+    for (final relationship in relsXml.findAllElements('Relationship')) {
+      final String type = relationship.getAttribute('Type') ?? '';
+      if (!type.endsWith('/image')) {
+        continue;
+      }
+      final String relId = relationship.getAttribute('Id') ?? '';
+      final String target = relationship.getAttribute('Target') ?? '';
+      if (relId.isEmpty || target.isEmpty) {
+        continue;
+      }
+      final ArchiveFile? imageFile = archive.findFile('word/$target');
+      final dynamic content = imageFile?.content;
+      if (content is List<int>) {
+        imageBytesMap[relId] = Uint8List.fromList(content);
+      }
+    }
+    debugPrint(
+      'WordToPdf _buildOoxmlImageBytesMap imageCount=${imageBytesMap.length}',
+    );
+    return imageBytesMap;
+  }
+
+  static _WordImageBlock? _parseRunImageBlock(
+    XmlElement run,
+    Map<String, Uint8List> imageBytesMap,
+  ) {
+    final XmlElement? drawing = run.getElement('w:drawing');
+    if (drawing == null) {
+      return null;
+    }
+
+    XmlElement? blipElement;
+    XmlElement? extentElement;
+    for (final element in drawing.descendants.whereType<XmlElement>()) {
+      if (blipElement == null && element.name.local == 'blip') {
+        blipElement = element;
+      }
+      if (extentElement == null && element.name.local == 'extent') {
+        extentElement = element;
+      }
+    }
+    if (blipElement == null) {
+      return null;
+    }
+
+    final String relId =
+        blipElement.getAttribute('r:embed') ??
+        blipElement.getAttribute('embed') ??
+        '';
+    final Uint8List? bytes = imageBytesMap[relId];
+    if (relId.isEmpty || bytes == null) {
+      return null;
+    }
+
+    return _WordImageBlock(
+      bytes: bytes,
+      widthPt: _emuToPt(extentElement?.getAttribute('cx')),
+      heightPt: _emuToPt(extentElement?.getAttribute('cy')),
+    );
+  }
+
+  static double? _emuToPt(String? emuText) {
+    final int? value = int.tryParse(emuText ?? '');
+    if (value == null || value <= 0) {
+      return null;
+    }
+    return value / 12700.0;
   }
 
   static String _normalizeHtmlDocument(String html) {
@@ -594,6 +779,18 @@ class _WordParagraphBlock extends _WordBlock {
   final String headingTag;
 
   bool get isEmpty => spanList.every((value) => value.text.trim().isEmpty);
+}
+
+class _WordImageBlock extends _WordBlock {
+  const _WordImageBlock({
+    required this.bytes,
+    this.widthPt,
+    this.heightPt,
+  });
+
+  final Uint8List bytes;
+  final double? widthPt;
+  final double? heightPt;
 }
 
 class _WordTableBlock extends _WordBlock {

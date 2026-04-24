@@ -75,7 +75,7 @@ class _WordFileViewState extends State<WordFileView> {
   }
 
   Widget _buildEditing(BuildContext context, WordFileController controller) {
-    if (controller.isHtmlEditable) {
+    if (controller.usesHtmlEditor) {
       if (controller.preparingHtmlEditor ||
           controller.htmlEditorController == null) {
         return widget.loadingBuilder?.call(context) ??
@@ -119,7 +119,7 @@ class _WordFileViewState extends State<WordFileView> {
   }
 
   Widget _buildPreview(BuildContext context, WordFileController controller) {
-    if (controller.isHtmlEditable) {
+    if (controller.usesHtmlPreview) {
       if (controller.preparingHtmlPreview ||
           controller.htmlPreviewController == null) {
         return widget.loadingBuilder?.call(context) ??

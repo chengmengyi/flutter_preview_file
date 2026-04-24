@@ -60,6 +60,21 @@ class MethodChannelFlutterPreviewFile extends FlutterPreviewFilePlatform {
   }
 
   @override
+  Future<bool> saveImageToGallery({
+    required String sourcePath,
+    required String displayName,
+    String? relativePath,
+  }) async {
+    final bool? value = await methodChannel
+        .invokeMethod<bool>('saveImageToGallery', <String, dynamic>{
+          'sourcePath': sourcePath,
+          'displayName': displayName,
+          'relativePath': relativePath,
+        });
+    return value ?? false;
+  }
+
+  @override
   Future<int> getPdfPageCount(String path) async {
     final value = await methodChannel.invokeMethod<int>('getPdfPageCount', {
       'path': path,

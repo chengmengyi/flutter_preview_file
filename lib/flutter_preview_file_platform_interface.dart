@@ -55,6 +55,14 @@ abstract class FlutterPreviewFilePlatform extends PlatformInterface {
     throw UnimplementedError('scanFile() has not been implemented.');
   }
 
+  Future<bool> saveImageToGallery({
+    required String sourcePath,
+    required String displayName,
+    String? relativePath,
+  }) {
+    throw UnimplementedError('saveImageToGallery() has not been implemented.');
+  }
+
   Future<int> getPdfPageCount(String path) {
     throw UnimplementedError('getPdfPageCount() has not been implemented.');
   }

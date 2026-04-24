@@ -33,6 +33,11 @@ class WordFileController extends ChangeNotifier {
   bool _initialized = false;
 
   bool get isHtmlEditable => loadedFileType == 'html';
+  bool get isOoxmlImageEditable =>
+      loadedFileType == 'ooxml' && htmlText.contains('<img');
+  bool get usesHtmlEditor => isHtmlEditable || isOoxmlImageEditable;
+  bool get usesHtmlPreview =>
+      loadedFileType == 'html' || htmlText.contains('<img');
 
   Future<void> initialize({bool force = false}) async {
     if (_initialized && !force) {
@@ -65,8 +70,8 @@ class WordFileController extends ChangeNotifier {
       htmlText = loadedContent.html;
       plainText = loadedContent.text;
       loadedFileType = loadedContent.type;
-      originalHtmlDocument = loadedFileType == 'html' ? loadedContent.html : '';
-      if (isHtmlEditable) {
+      originalHtmlDocument = loadedContent.html;
+      if (usesHtmlPreview) {
         await _prepareHtmlPreview();
       }
       textEditingController.text = plainText;
@@ -94,13 +99,13 @@ class WordFileController extends ChangeNotifier {
     if (loading || saving || errorText.isNotEmpty || isEditing) {
       return;
     }
-    if (isHtmlEditable) {
+    if (usesHtmlEditor) {
       await _prepareHtmlEditor();
     }
     isEditing = true;
     textEditingController.text = plainText;
     notifyListeners();
-    if (!isHtmlEditable) {
+    if (!usesHtmlEditor) {
       Future<void>.delayed(const Duration(milliseconds: 100), () async {
         if (textFocusNode.canRequestFocus) {
           textFocusNode.requestFocus();
@@ -130,6 +135,8 @@ class WordFileController extends ChangeNotifier {
       final newText = textEditingController.text;
       if (isHtmlEditable) {
         await _saveHtmlDocument();
+      } else if (isOoxmlImageEditable) {
+        await _saveOoxmlHtmlDocument();
       } else {
         final file = File(filePath);
         final extension = _queryExtension(filePath);
@@ -204,6 +211,183 @@ class WordFileController extends ChangeNotifier {
     await _prepareHtmlPreview();
   }
 
+  Future<void> _saveOoxmlHtmlDocument() async {
+    final controller = htmlEditorController;
+    if (controller == null) {
+      throw Exception('HTML editor is not ready.');
+    }
+    final blocks = await _queryEditedOoxmlBlocks(controller);
+    final bytes = await File(filePath).readAsBytes();
+    final archive = ZipDecoder().decodeBytes(bytes);
+    final documentIndex = archive.files.indexWhere(
+      (file) => file.name == 'word/document.xml',
+    );
+    if (documentIndex < 0) {
+      throw Exception('word/document.xml not found');
+    }
+    final oldFile = archive[documentIndex];
+    final oldXml = XmlDocument.parse(utf8.decode(oldFile.content as List<int>));
+    final xmlText = _buildOoxmlDocumentXmlFromBlocks(oldXml, blocks);
+    final xmlBytes = utf8.encode(xmlText);
+    archive[documentIndex] =
+        ArchiveFile(oldFile.name, xmlBytes.length, xmlBytes)
+          ..compress = oldFile.compress
+          ..mode = oldFile.mode
+          ..lastModTime = oldFile.lastModTime;
+    final encodedBytes = ZipEncoder().encode(archive);
+    if (encodedBytes == null) {
+      throw Exception('Failed to save docx content.');
+    }
+    await File(filePath).writeAsBytes(encodedBytes, flush: true);
+
+    final loadedContent = await _loadWordContent();
+    htmlText = loadedContent.html;
+    plainText = loadedContent.text;
+    loadedFileType = loadedContent.type;
+    originalHtmlDocument = loadedContent.html;
+    textEditingController.text = plainText;
+    await _prepareHtmlPreview();
+  }
+
+  Future<List<Map<String, dynamic>>> _queryEditedOoxmlBlocks(
+    WebViewController controller,
+  ) async {
+    final result = await controller.runJavaScriptReturningResult(r'''
+(function () {
+  function pushText(items, text) {
+    if (!text) {
+      return;
+    }
+    var normalized = text.replace(/\u00a0/g, ' ');
+    if (
+      normalized.indexOf('img[data-docx-embed-id]') >= 0 ||
+      normalized.indexOf("document.addEventListener('click'") >= 0 ||
+      normalized.indexOf('docx-selected-image') >= 0
+    ) {
+      return;
+    }
+    if (normalized.trim().length > 0) {
+      items.push({ type: 'text', text: normalized });
+    }
+  }
+
+  function readInline(node, items) {
+    if (node.nodeType === Node.TEXT_NODE) {
+      pushText(items, node.nodeValue || '');
+      return;
+    }
+    if (node.nodeType !== Node.ELEMENT_NODE) {
+      return;
+    }
+    var tagName = node.tagName;
+    if (tagName === 'STYLE' || tagName === 'SCRIPT') {
+      return;
+    }
+    if (tagName === 'IMG') {
+      var embedId = node.getAttribute('data-docx-embed-id') || '';
+      if (embedId) {
+        items.push({ type: 'image', embedId: embedId });
+      }
+      return;
+    }
+    if (tagName === 'BR') {
+      items.push({ type: 'break' });
+      return;
+    }
+    Array.prototype.forEach.call(node.childNodes, function (child) {
+      readInline(child, items);
+    });
+  }
+
+  function readParagraph(node) {
+    var items = [];
+    readInline(node, items);
+    if (!items.length) {
+      return null;
+    }
+    return {
+      type: 'paragraph',
+      tag: (node.tagName || 'p').toLowerCase(),
+      items: items
+    };
+  }
+
+  function readTable(node) {
+    var rows = [];
+    Array.prototype.forEach.call(node.querySelectorAll('tr'), function (row) {
+      var cells = [];
+      Array.prototype.forEach.call(row.children, function (cell) {
+        if (cell.tagName !== 'TD' && cell.tagName !== 'TH') {
+          return;
+        }
+        var items = [];
+        readInline(cell, items);
+        cells.push({ items: items });
+      });
+      if (cells.length) {
+        rows.push({ cells: cells });
+      }
+    });
+    if (!rows.length) {
+      return null;
+    }
+    return { type: 'table', rows: rows };
+  }
+
+  function appendNode(node, blocks) {
+    if (node.nodeType === Node.TEXT_NODE) {
+      var items = [];
+      pushText(items, node.nodeValue || '');
+      if (items.length) {
+        blocks.push({ type: 'paragraph', tag: 'p', items: items });
+      }
+      return;
+    }
+    if (node.nodeType !== Node.ELEMENT_NODE) {
+      return;
+    }
+    if (node.tagName === 'TABLE') {
+      var table = readTable(node);
+      if (table) {
+        blocks.push(table);
+      }
+      return;
+    }
+    if (node.tagName === 'UL' || node.tagName === 'OL') {
+      Array.prototype.forEach.call(node.children, function (child) {
+        var paragraph = readParagraph(child);
+        if (paragraph) {
+          paragraph.tag = 'li';
+          blocks.push(paragraph);
+        }
+      });
+      return;
+    }
+    var paragraph = readParagraph(node);
+    if (paragraph) {
+      blocks.push(paragraph);
+    }
+  }
+
+  var blocks = [];
+  Array.prototype.forEach.call(document.body.childNodes, function (node) {
+    appendNode(node, blocks);
+  });
+  return btoa(unescape(encodeURIComponent(JSON.stringify(blocks))));
+})()
+''');
+    final decoded = _decodeHtmlEditorResult(result);
+    final list = jsonDecode(decoded) as List<dynamic>;
+    return list
+        .whereType<Map<dynamic, dynamic>>()
+        .map(
+          (item) => item.map(
+            (key, value) => MapEntry(key.toString(), value),
+          ),
+        )
+        .toList(growable: false);
+  }
+
   Future<_WordLoadedContent> _loadWordContent() async {
     final extension = _queryExtension(filePath);
     if (extension != 'docx' && extension != 'doc' && extension != 'txt') {
@@ -231,7 +415,11 @@ class WordFileController extends ChangeNotifier {
       final documentXml = XmlDocument.parse(
         utf8.decode(documentFile.content as List<int>),
       );
-      return _buildOoxmlContent(documentXml);
+      return _buildOoxmlContent(
+        documentXml,
+        archive,
+        _buildDocumentRelationshipMap(archive),
+      );
     }
 
     final result = await FlutterPreviewFile.loadDocContent(filePath);
@@ -245,7 +433,11 @@ class WordFileController extends ChangeNotifier {
     );
   }
 
-  _WordLoadedContent _buildOoxmlContent(XmlDocument documentXml) {
+  _WordLoadedContent _buildOoxmlContent(
+    XmlDocument documentXml,
+    Archive archive,
+    Map<String, String> relationshipMap,
+  ) {
     final body = documentXml.findAllElements('w:body').firstOrNull;
     if (body == null) {
       return const _WordLoadedContent(html: '', text: '', type: 'ooxml');
@@ -256,7 +448,11 @@ class WordFileController extends ChangeNotifier {
 
     for (final node in body.childElements) {
       if (node.name.qualified == 'w:p') {
-        final paragraphContent = _parseParagraphContent(node);
+        final paragraphContent = _parseParagraphContent(
+          node,
+          archive,
+          relationshipMap,
+        );
         final isList = node.findAllElements('w:numPr').isNotEmpty;
         if (paragraphContent.html.isEmpty && paragraphContent.text.isEmpty) {
           continue;
@@ -281,7 +477,7 @@ class WordFileController extends ChangeNotifier {
         }
         textBuffer.write(paragraphContent.text);
       } else if (node.name.qualified == 'w:tbl') {
-        final tableContent = _parseTableContent(node);
+        final tableContent = _parseTableContent(node, archive, relationshipMap);
         if (listOpened) {
           htmlBuffer.writeln('</ul>');
           listOpened = false;
@@ -310,10 +506,22 @@ class WordFileController extends ChangeNotifier {
     );
   }
 
-  _WordNodeContent _parseParagraphContent(XmlElement paragraph) {
+  _WordNodeContent _parseParagraphContent(
+    XmlElement paragraph,
+    Archive archive,
+    Map<String, String> relationshipMap,
+  ) {
     final htmlBuffer = StringBuffer();
     final textBuffer = StringBuffer();
     for (final run in paragraph.findElements('w:r')) {
+      final imageHtml = _buildImageHtml(run, archive, relationshipMap);
+      if (imageHtml.isNotEmpty) {
+        htmlBuffer.write(imageHtml);
+        if (textBuffer.isNotEmpty) {
+          textBuffer.write(' ');
+        }
+        textBuffer.write('[图片]');
+      }
       final text = run
           .findAllElements('w:t')
           .map((element) => element.innerText)
@@ -347,7 +555,11 @@ class WordFileController extends ChangeNotifier {
     );
   }
 
-  _WordNodeContent _parseTableContent(XmlElement table) {
+  _WordNodeContent _parseTableContent(
+    XmlElement table,
+    Archive archive,
+    Map<String, String> relationshipMap,
+  ) {
     final htmlBuffer = StringBuffer();
     final textBuffer = StringBuffer();
     htmlBuffer.writeln('<table border="1" cellspacing="0" cellpadding="6">');
@@ -358,7 +570,11 @@ class WordFileController extends ChangeNotifier {
         final cellContent = StringBuffer();
         final cellTexts = <String>[];
         for (final paragraph in cell.findElements('w:p')) {
-          final paragraphContent = _parseParagraphContent(paragraph);
+          final paragraphContent = _parseParagraphContent(
+            paragraph,
+            archive,
+            relationshipMap,
+          );
           if (paragraphContent.html.isNotEmpty) {
             cellContent.writeln('<p>${paragraphContent.html}</p>');
           }
@@ -405,6 +621,144 @@ class WordFileController extends ChangeNotifier {
     return 'p';
   }
 
+  Map<String, String> _buildDocumentRelationshipMap(Archive archive) {
+    final relationshipFile = archive.findFile('word/_rels/document.xml.rels');
+    if (relationshipFile == null) {
+      return const {};
+    }
+    final relationshipsXml = XmlDocument.parse(
+      utf8.decode(relationshipFile.content as List<int>),
+    );
+    final relationshipMap = <String, String>{};
+    for (final relation in relationshipsXml.findAllElements('Relationship')) {
+      final id = relation.getAttribute('Id') ?? '';
+      final target = relation.getAttribute('Target') ?? '';
+      if (id.isEmpty || target.isEmpty) {
+        continue;
+      }
+      relationshipMap[id] = target;
+    }
+    return relationshipMap;
+  }
+
+  String _buildImageHtml(
+    XmlElement run,
+    Archive archive,
+    Map<String, String> relationshipMap,
+  ) {
+    final imageHtmlList = <String>[];
+
+    for (final drawing in run.findAllElements('w:drawing')) {
+      final embedId = _findImageEmbedId(drawing);
+      final imageHtml = _buildEmbeddedImageHtml(
+        embedId: embedId,
+        archive: archive,
+        relationshipMap: relationshipMap,
+      );
+      if (imageHtml.isNotEmpty) {
+        imageHtmlList.add(imageHtml);
+      }
+    }
+
+    for (final imageData in run.findAllElements('v:imagedata')) {
+      final embedId =
+          imageData.getAttribute('r:id') ??
+          imageData.getAttribute(
+            'id',
+            namespace: 'http://schemas.openxmlformats.org/officeDocument/2006/relationships',
+          ) ??
+          '';
+      final imageHtml = _buildEmbeddedImageHtml(
+        embedId: embedId,
+        archive: archive,
+        relationshipMap: relationshipMap,
+      );
+      if (imageHtml.isNotEmpty) {
+        imageHtmlList.add(imageHtml);
+      }
+    }
+
+    return imageHtmlList.join();
+  }
+
+  String _findImageEmbedId(XmlElement drawing) {
+    for (final blip in drawing.findAllElements('a:blip')) {
+      final embedId =
+          blip.getAttribute('r:embed') ??
+          blip.getAttribute(
+            'embed',
+            namespace: 'http://schemas.openxmlformats.org/officeDocument/2006/relationships',
+          ) ??
+          '';
+      if (embedId.isNotEmpty) {
+        return embedId;
+      }
+    }
+    return '';
+  }
+
+  String _buildEmbeddedImageHtml({
+    required String embedId,
+    required Archive archive,
+    required Map<String, String> relationshipMap,
+  }) {
+    if (embedId.isEmpty) {
+      return '';
+    }
+    final target = relationshipMap[embedId];
+    if (target == null || target.isEmpty) {
+      return '';
+    }
+    final normalizedPath = _normalizeWordTargetPath(target);
+    final imageFile = archive.findFile(normalizedPath);
+    final imageBytes = imageFile?.content;
+    if (imageBytes is! List<int> || imageBytes.isEmpty) {
+      return '';
+    }
+    final mimeType = _queryImageMimeType(normalizedPath);
+    final base64Image = base64Encode(imageBytes);
+    final escapedEmbedId = _escapeXmlAttribute(embedId);
+    return '<img src="data:$mimeType;base64,$base64Image" '
+        'data-docx-embed-id="$escapedEmbedId" '
+        'contenteditable="false" '
+        'style="max-width: 100%; height: auto; vertical-align: middle;"/>';
+  }
+
+  String _normalizeWordTargetPath(String target) {
+    final normalized = target.replaceAll('\\', '/');
+    if (normalized.startsWith('/')) {
+      return normalized.substring(1);
+    }
+    if (normalized.startsWith('word/')) {
+      return normalized;
+    }
+    return 'word/$normalized';
+  }
+
+  String _queryImageMimeType(String path) {
+    final extension = _queryExtension(path);
+    switch (extension) {
+      case 'png':
+        return 'image/png';
+      case 'jpg':
+      case 'jpeg':
+        return 'image/jpeg';
+      case 'gif':
+        return 'image/gif';
+      case 'bmp':
+        return 'image/bmp';
+      case 'webp':
+        return 'image/webp';
+      case 'svg':
+        return 'image/svg+xml';
+      case 'tif':
+      case 'tiff':
+        return 'image/tiff';
+      default:
+        return 'application/octet-stream';
+    }
+  }
+
   Future<void> _saveOoxmlTextContent(List<int> bytes, String text) async {
     final archive = ZipDecoder().decodeBytes(bytes);
     final documentIndex = archive.files.indexWhere(
@@ -427,6 +781,160 @@ class WordFileController extends ChangeNotifier {
       throw Exception('Failed to save docx content.');
     }
     await File(filePath).writeAsBytes(encodedBytes, flush: true);
+  }
+
+  String _buildOoxmlDocumentXmlFromBlocks(
+    XmlDocument oldXml,
+    List<Map<String, dynamic>> blocks,
+  ) {
+    final root = oldXml.rootElement;
+    final body = root.findElements('w:body').firstOrNull;
+    if (body == null) {
+      throw Exception('w:body not found');
+    }
+    final sectPr =
+        body.findElements('w:sectPr').firstOrNull?.toXmlString() ?? '';
+    final imageRunMap = _buildImageRunXmlMap(oldXml);
+    final contentBuffer = StringBuffer();
+    for (final block in blocks) {
+      final type = block['type']?.toString() ?? '';
+      if (type == 'table') {
+        contentBuffer.write(_buildOoxmlTableXml(block, imageRunMap));
+      } else {
+        contentBuffer.write(_buildOoxmlParagraphXml(block, imageRunMap));
+      }
+    }
+    if (contentBuffer.isEmpty) {
+      contentBuffer.write('<w:p/>');
+    }
+
+    final attributes = root.attributes
+        .map(
+          (attribute) =>
+              '${attribute.name.qualified}="${_escapeXmlAttribute(attribute.value)}"',
+        )
+        .join(' ');
+    return '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        '<${root.name.qualified} $attributes>'
+        '<w:body>${contentBuffer.toString()}$sectPr</w:body>'
+        '</${root.name.qualified}>';
+  }
+
+  Map<String, String> _buildImageRunXmlMap(XmlDocument oldXml) {
+    final imageRunMap = <String, String>{};
+    for (final run in oldXml.findAllElements('w:r')) {
+      for (final drawing in run.findAllElements('w:drawing')) {
+        final embedId = _findImageEmbedId(drawing);
+        if (embedId.isNotEmpty) {
+          imageRunMap[embedId] = run.toXmlString();
+        }
+      }
+      for (final imageData in run.findAllElements('v:imagedata')) {
+        final embedId =
+            imageData.getAttribute('r:id') ??
+            imageData.getAttribute(
+              'id',
+              namespace: 'http://schemas.openxmlformats.org/officeDocument/2006/relationships',
+            ) ??
+            '';
+        if (embedId.isNotEmpty) {
+          imageRunMap[embedId] = run.toXmlString();
+        }
+      }
+    }
+    return imageRunMap;
+  }
+
+  String _buildOoxmlParagraphXml(
+    Map<String, dynamic> block,
+    Map<String, String> imageRunMap,
+  ) {
+    final runXml = _buildOoxmlRunXmlList(
+      _queryMapList(block['items']),
+      imageRunMap,
+    );
+    if (runXml.isEmpty) {
+      return '<w:p/>';
+    }
+    return '<w:p>$runXml</w:p>';
+  }
+
+  String _buildOoxmlTableXml(
+    Map<String, dynamic> block,
+    Map<String, String> imageRunMap,
+  ) {
+    final buffer = StringBuffer()..write('<w:tbl>');
+    for (final row in _queryMapList(block['rows'])) {
+      buffer.write('<w:tr>');
+      for (final cell in _queryMapList(row['cells'])) {
+        final runXml = _buildOoxmlRunXmlList(
+          _queryMapList(cell['items']),
+          imageRunMap,
+        );
+        buffer.write('<w:tc><w:p>$runXml</w:p></w:tc>');
+      }
+      buffer.write('</w:tr>');
+    }
+    buffer.write('</w:tbl>');
+    return buffer.toString();
+  }
+
+  String _buildOoxmlRunXmlList(
+    List<Map<String, dynamic>> items,
+    Map<String, String> imageRunMap,
+  ) {
+    final buffer = StringBuffer();
+    for (final item in items) {
+      final type = item['type']?.toString() ?? '';
+      if (type == 'image') {
+        final embedId = item['embedId']?.toString() ?? '';
+        final imageRunXml = imageRunMap[embedId];
+        if (imageRunXml != null && imageRunXml.isNotEmpty) {
+          buffer.write(imageRunXml);
+        }
+      } else if (type == 'break') {
+        buffer.write('<w:r><w:br/></w:r>');
+      } else if (type == 'text') {
+        final text = _sanitizeEditorArtifactText(item['text']?.toString() ?? '');
+        if (text.isNotEmpty) {
+          final escapedText = const HtmlEscape(
+            HtmlEscapeMode.element,
+          ).convert(text);
+          buffer.write(
+            '<w:r><w:t xml:space="preserve">$escapedText</w:t></w:r>',
+          );
+        }
+      }
+    }
+    return buffer.toString();
+  }
+
+  String _sanitizeEditorArtifactText(String text) {
+    if (text.isEmpty) {
+      return '';
+    }
+    final normalized = text
+        .replaceAll(RegExp(r'img\[data-docx-embed-id\][\s\S]*?docx-selected-image\s*\{[\s\S]*?\}'), '')
+        .replaceAll(
+          RegExp(r"document\.addEventListener\('click'[\s\S]*?image\.remove\(\);\s*\}\);"),
+          '',
+        )
+        .trim();
+    return normalized;
+  }
+
+  List<Map<String, dynamic>> _queryMapList(Object? value) {
+    if (value is! List) {
+      return const [];
+    }
+    return value
+        .whereType<Map<dynamic, dynamic>>()
+        .map(
+          (item) => item.map(
+            (key, value) => MapEntry(key.toString(), value),
+          ),
+        )
+        .toList();
   }
 
   String _buildOoxmlDocumentXml(XmlDocument oldXml, String text) {
@@ -494,14 +1002,64 @@ class WordFileController extends ChangeNotifier {
   }
 
   String _buildEditableHtmlDocument(String html) {
+    const editorEnhancements = '''
+<style>
+  img[data-docx-embed-id] {
+    cursor: pointer;
+    display: inline-block;
+    user-select: all;
+  }
+  img[data-docx-embed-id].docx-selected-image {
+    outline: 2px solid #2f80ed;
+    outline-offset: 2px;
+  }
+</style>
+<script>
+  document.addEventListener('click', function (event) {
+    document.querySelectorAll('img.docx-selected-image').forEach(function (image) {
+      image.classList.remove('docx-selected-image');
+    });
+    if (event.target && event.target.matches('img[data-docx-embed-id]')) {
+      event.target.classList.add('docx-selected-image');
+    }
+  });
+  document.addEventListener('keydown', function (event) {
+    if (event.key !== 'Backspace' && event.key !== 'Delete') {
+      return;
+    }
+    var image = document.querySelector('img.docx-selected-image');
+    if (!image) {
+      return;
+    }
+    event.preventDefault();
+    image.remove();
+  });
+</script>
+''';
     final bodyPattern = RegExp(r'<body\b([^>]*)>', caseSensitive: false);
-    if (bodyPattern.hasMatch(html)) {
-      return html.replaceFirstMapped(bodyPattern, (match) {
+    final headClosePattern = RegExp(r'</head>', caseSensitive: false);
+    final htmlOpenPattern = RegExp(r'<html\b[^>]*>', caseSensitive: false);
+
+    String htmlWithEditorAssets;
+    if (headClosePattern.hasMatch(html)) {
+      htmlWithEditorAssets = html.replaceFirstMapped(headClosePattern, (match) {
+        return '$editorEnhancements</head>';
+      });
+    } else if (htmlOpenPattern.hasMatch(html)) {
+      htmlWithEditorAssets = html.replaceFirstMapped(htmlOpenPattern, (match) {
+        return '${match.group(0)}<head>$editorEnhancements</head>';
+      });
+    } else {
+      htmlWithEditorAssets = '<html><head>$editorEnhancements</head>$html</html>';
+    }
+
+    if (bodyPattern.hasMatch(htmlWithEditorAssets)) {
+      return htmlWithEditorAssets.replaceFirstMapped(bodyPattern, (match) {
         final attributes = match.group(1) ?? '';
         return '<body$attributes contenteditable="true">';
       });
     }
-    return '<html><body contenteditable="true">$html</body></html>';
+    return '<html><head>$editorEnhancements</head><body contenteditable="true">$htmlWithEditorAssets</body></html>';
   }
 
   String _replaceHtmlBody(String originalHtml, String innerHtml) {

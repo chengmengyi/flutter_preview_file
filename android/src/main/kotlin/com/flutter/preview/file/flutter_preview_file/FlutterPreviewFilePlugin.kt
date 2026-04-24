@@ -1,15 +1,20 @@
 package com.flutter.preview.file.flutter_preview_file
 
 import android.app.Activity
+import android.content.ContentValues
+import android.content.Intent
 import android.graphics.Bitmap
 import android.graphics.Canvas
 import android.graphics.Color
 import android.graphics.pdf.PdfDocument
 import android.graphics.pdf.PdfRenderer
 import android.media.MediaScannerConnection
+import android.os.Build
+import android.os.Environment
 import android.os.Handler
 import android.os.Looper
 import android.os.ParcelFileDescriptor
+import android.provider.MediaStore
 import android.util.Log
 import android.view.View
 import android.view.ViewGroup
@@ -143,6 +148,31 @@ class FlutterPreviewFilePlugin : FlutterPlugin, MethodCallHandler, ActivityAware
                     result.error(
                         "scan_failed",
                         e.message ?: "Failed to scan file",
+                        null,
+                    )
+                }
+            }
+
+            "saveImageToGallery" -> {
+                val sourcePath = call.argument<String>("sourcePath")
+                val displayName = call.argument<String>("displayName")
+                val relativePath = call.argument<String>("relativePath")
+                if (sourcePath.isNullOrEmpty() || displayName.isNullOrEmpty()) {
+                    result.error("invalid_args", "Save image arguments are invalid", null)
+                    return
+                }
+                try {
+                    result.success(
+                        saveImageToGallery(
+                            sourcePath = sourcePath,
+                            displayName = displayName,
+                            relativePath = relativePath,
+                        ),
+                    )
+                } catch (e: Exception) {
+                    result.error(
+                        "save_gallery_failed",
+                        e.message ?: "Failed to save image to gallery",
                         null,
                     )
                 }
@@ -450,6 +480,100 @@ class FlutterPreviewFilePlugin : FlutterPlugin, MethodCallHandler, ActivityAware
         }
     }
 
+    private fun saveImageToGallery(
+        sourcePath: String,
+        displayName: String,
+        relativePath: String?,
+    ): Boolean {
+        val sourceFile = File(sourcePath)
+        if (!sourceFile.exists()) {
+            return false
+        }
+        val mimeType = queryMimeType(sourceFile) ?: "image/png"
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            return saveImageToGalleryByMediaStore(
+                sourceFile = sourceFile,
+                displayName = displayName,
+                mimeType = mimeType,
+                relativePath = relativePath ?: "${Environment.DIRECTORY_DCIM}/Camera",
+            )
+        }
+        return saveImageToLegacyGallery(
+            sourceFile = sourceFile,
+            displayName = displayName,
+            mimeType = mimeType,
+            relativePath = relativePath,
+        )
+    }
+
+    private fun saveImageToGalleryByMediaStore(
+        sourceFile: File,
+        displayName: String,
+        mimeType: String,
+        relativePath: String,
+    ): Boolean {
+        val now = System.currentTimeMillis()
+        val values = ContentValues().apply {
+            put(MediaStore.Images.Media.DISPLAY_NAME, displayName)
+            put(MediaStore.Images.Media.MIME_TYPE, mimeType)
+            put(MediaStore.Images.Media.RELATIVE_PATH, relativePath)
+            put(MediaStore.Images.Media.DATE_ADDED, now / 1000)
+            put(MediaStore.Images.Media.DATE_MODIFIED, now / 1000)
+            put(MediaStore.Images.Media.DATE_TAKEN, now)
+            put(MediaStore.Images.Media.IS_PENDING, 1)
+        }
+        val resolver = binding.applicationContext.contentResolver
+        val uri =
+            resolver.insert(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, values) ?: return false
+        return try {
+            resolver.openOutputStream(uri)?.use { outputStream ->
+                FileInputStream(sourceFile).use { inputStream ->
+                    inputStream.copyTo(outputStream)
+                }
+            } ?: return false
+            values.clear()
+            values.put(MediaStore.Images.Media.IS_PENDING, 0)
+            resolver.update(uri, values, null, null)
+            resolver.notifyChange(uri, null)
+            binding.applicationContext.sendBroadcast(
+                Intent(Intent.ACTION_MEDIA_SCANNER_SCAN_FILE, uri),
+            )
+            true
+        } catch (e: Exception) {
+            resolver.delete(uri, null, null)
+            throw e
+        }
+    }
+
+    private fun saveImageToLegacyGallery(
+        sourceFile: File,
+        displayName: String,
+        mimeType: String,
+        relativePath: String?,
+    ): Boolean {
+        val outputDirectory = if (relativePath.isNullOrBlank()) {
+            Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DCIM)
+        } else {
+            File(Environment.getExternalStorageDirectory(), relativePath)
+        }
+        if (!outputDirectory.exists()) {
+            outputDirectory.mkdirs()
+        }
+        val outputFile = File(outputDirectory, displayName)
+        FileInputStream(sourceFile).use { inputStream ->
+            FileOutputStream(outputFile).use { outputStream ->
+                inputStream.copyTo(outputStream)
+            }
+        }
+        MediaScannerConnection.scanFile(
+            binding.applicationContext,
+            arrayOf(outputFile.absolutePath),
+            arrayOf(mimeType),
+            null,
+        )
+        return true
+    }
+
     private fun queryMimeType(file: File): String? {
         val extension = file.extension.lowercase()
         if (extension.isEmpty()) {
@@ -458,6 +582,8 @@ class FlutterPreviewFilePlugin : FlutterPlugin, MethodCallHandler, ActivityAware
         return MimeTypeMap.getSingleton().getMimeTypeFromExtension(extension)
             ?: when (extension) {
                 "pdf" -> "application/pdf"
+                "png" -> "image/png"
+                "jpg", "jpeg" -> "image/jpeg"
                 else -> null
             }
     }

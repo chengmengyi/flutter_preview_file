@@ -533,10 +533,6 @@ class FileToolsService {
     if (fileList.isEmpty) {
       throw Exception("Please select at least one file");
     }
-    final outputDirectory = Directory("/storage/emulated/0/Pictures");
-    if (!await outputDirectory.exists()) {
-      await outputDirectory.create(recursive: true);
-    }
     final pdfTaskList = <_PdfExtractTask>[];
     int totalPageCount = 0;
     for (final bean in fileList) {
@@ -559,30 +555,46 @@ class FileToolsService {
       throw Exception("Failed to save images");
     }
     onProgress?.call(0);
+    final tempDirectory = await Directory.systemTemp.createTemp(
+      "flutter_preview_gallery_",
+    );
     int savedCount = 0;
-    for (final task in pdfTaskList) {
-      final pdfPath = task.fileInfo.path ?? "";
-      for (int pageIndex = 0; pageIndex < task.pageCount; pageIndex++) {
-        savedCount++;
-        final outputFile = File(
-          "${outputDirectory.path}/pdf_Image_${savedCount.toString().padLeft(2, "0")}.png",
-        );
-        if (await outputFile.exists()) {
-          await outputFile.delete();
+    try {
+      for (final task in pdfTaskList) {
+        final pdfPath = task.fileInfo.path ?? "";
+        for (int pageIndex = 0; pageIndex < task.pageCount; pageIndex++) {
+          savedCount++;
+          final outputFile = File(
+            "${tempDirectory.path}/pdf_Image_${savedCount.toString().padLeft(2, "0")}.png",
+          );
+          if (await outputFile.exists()) {
+            await outputFile.delete();
+          }
+          final outputPath = await FlutterPreviewFile.renderPdfPageToImage(
+            pdfPath: pdfPath,
+            pageIndex: pageIndex,
+            outputPath: outputFile.path,
+          );
+          if ((outputPath ?? "").isEmpty) {
+            throw Exception("Failed to save images");
+          }
+          final bool saved = await FlutterPreviewFile.saveImageToGallery(
+            sourcePath: outputPath!,
+            displayName: outputFile.uri.pathSegments.last,
+            relativePath: "DCIM/Camera",
+          );
+          if (!saved) {
+            throw Exception("Failed to save images");
+          }
+          onProgress?.call(savedCount / totalPageCount);
         }
-        final outputPath = await FlutterPreviewFile.renderPdfPageToImage(
-          pdfPath: pdfPath,
-          pageIndex: pageIndex,
-          outputPath: outputFile.path,
-        );
-        if ((outputPath ?? "").isEmpty) {
-          throw Exception("Failed to save images");
-        }
-        await FlutterPreviewFile.scanFile(outputPath!);
-        onProgress?.call(savedCount / totalPageCount);
+      }
+      return totalPageCount;
+    } finally {
+      if (await tempDirectory.exists()) {
+        await tempDirectory.delete(recursive: true);
       }
     }
-    return totalPageCount;
   }
 
   Future<String> queryNextScanPdfName() async {
