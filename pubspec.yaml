@@ -3,6 +3,7 @@ description: "Reusable preview and edit widgets for PDF, Word, and Excel files."
 version: 0.0.5
 homepage: https://github.com/chengmengyi/flutter_preview_file
 
+
 environment:
   sdk: ^3.9.2
   flutter: '>=3.3.0'
