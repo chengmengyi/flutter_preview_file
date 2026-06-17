@@ -1,6 +1,6 @@
 name: flutter_preview_file
 description: "Reusable preview and edit widgets for PDF, Word, and Excel files."
-version: 0.0.5
+version: 0.0.6
 homepage: https://github.com/chengmengyi/flutter_preview_file
 
 
@@ -33,6 +33,9 @@ dev_dependencies:
 
 # The following section is specific to Flutter packages.
 flutter:
+  assets:
+    - assets/fonts/NotoSansSC-VF.ttf
+
   # This section identifies this Flutter project as a plugin project.
   # The 'pluginClass' specifies the class (in Java, Kotlin, Swift, Objective-C, etc.)
   # which should be registered in the plugin registry. This is required for

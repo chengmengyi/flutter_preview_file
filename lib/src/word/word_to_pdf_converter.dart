@@ -3,15 +3,17 @@ import 'dart:io';
 
 import 'package:archive/archive.dart';
 import 'package:flutter/foundation.dart';
+import 'package:flutter/services.dart';
 import 'package:pdf/pdf.dart';
 import 'package:pdf/widgets.dart' as pw;
-import 'package:printing/printing.dart';
 import 'package:xml/xml.dart';
 
 import '../../flutter_preview_file_platform_interface.dart';
 
 class WordToPdfConverter {
   const WordToPdfConverter._();
+
+  static const defaultCjkFontAssetPath = 'assets/fonts/NotoSansSC-VF.ttf';
 
   static Future<String> convert({
     required String inputPath,
@@ -24,7 +26,11 @@ class WordToPdfConverter {
 
     final bytes = await file.readAsBytes();
     if (_isOoxmlFile(bytes)) {
-      await _convertOoxmlToPdf(bytes: bytes, outputPath: outputPath);
+      await _convertOoxmlToPdf(
+        bytes: bytes,
+        outputPath: outputPath,
+        assetFontBytes: await loadDefaultPdfFontAssetBytes(),
+      );
       return outputPath;
     }
 
@@ -50,6 +56,7 @@ class WordToPdfConverter {
   static Future<String> convertOoxmlFileToPdf({
     required String inputPath,
     required String outputPath,
+    Uint8List? assetFontBytes,
   }) async {
     debugPrint(
       'WordToPdf convertOoxmlFileToPdf start input=$inputPath output=$outputPath',
@@ -64,9 +71,29 @@ class WordToPdfConverter {
         'Current Word file requires native html to pdf conversion.',
       );
     }
-    await _convertOoxmlToPdf(bytes: bytes, outputPath: outputPath);
+    await _convertOoxmlToPdf(
+      bytes: bytes,
+      outputPath: outputPath,
+      assetFontBytes: assetFontBytes ?? await loadDefaultPdfFontAssetBytes(),
+    );
     debugPrint('WordToPdf convertOoxmlFileToPdf done output=$outputPath');
     return outputPath;
+  }
+
+  static Future<Uint8List?> loadDefaultPdfFontAssetBytes() async {
+    try {
+      final data = await rootBundle.load(
+        'packages/flutter_preview_file/$defaultCjkFontAssetPath',
+      );
+      return data.buffer.asUint8List(data.offsetInBytes, data.lengthInBytes);
+    } catch (_) {}
+
+    try {
+      final data = await rootBundle.load(defaultCjkFontAssetPath);
+      return data.buffer.asUint8List(data.offsetInBytes, data.lengthInBytes);
+    } catch (_) {}
+
+    return null;
   }
 
   static Future<String> loadWordHtml(String path) async {
@@ -98,8 +125,11 @@ class WordToPdfConverter {
   static Future<void> _convertOoxmlToPdf({
     required List<int> bytes,
     required String outputPath,
+    Uint8List? assetFontBytes,
   }) async {
-    debugPrint('WordToPdf _convertOoxmlToPdf decode zip start bytes=${bytes.length}');
+    debugPrint(
+      'WordToPdf _convertOoxmlToPdf decode zip start bytes=${bytes.length}',
+    );
     final archive = ZipDecoder().decodeBytes(bytes);
     final documentFile = archive.findFile('word/document.xml');
     if (documentFile == null) {
@@ -112,21 +142,28 @@ class WordToPdfConverter {
     final documentXml = XmlDocument.parse(
       utf8.decode(documentFile.content as List<int>),
     );
+    final fontNameSet = _buildOoxmlFontNameSet(archive, documentXml);
     debugPrint('WordToPdf _convertOoxmlToPdf xml parsed');
     final blockList = _buildOoxmlBlockList(documentXml, imageBytesMap);
-    debugPrint('WordToPdf _convertOoxmlToPdf blockList count=${blockList.length}');
+    debugPrint(
+      'WordToPdf _convertOoxmlToPdf blockList count=${blockList.length}',
+    );
     final document = pw.Document();
     debugPrint('WordToPdf _convertOoxmlToPdf load font start');
-    final font = await _loadPdfFont();
-    debugPrint('WordToPdf _convertOoxmlToPdf load font done hasFont=${font != null}');
-    final theme = font == null
-        ? null
-        : pw.ThemeData.withFont(
-            base: font,
-            bold: font,
-            italic: font,
-            boldItalic: font,
-          );
+    final fontConfig = await _loadPdfFontConfig(
+      assetFontBytes: assetFontBytes,
+      preferredFontNameSet: fontNameSet,
+    );
+    debugPrint(
+      'WordToPdf _convertOoxmlToPdf load font done fallbackCount=${fontConfig.fontFallback.length}',
+    );
+    final theme = pw.ThemeData.withFont(
+      base: fontConfig.base,
+      bold: fontConfig.base,
+      italic: fontConfig.base,
+      boldItalic: fontConfig.base,
+      fontFallback: fontConfig.fontFallback,
+    );
 
     document.addPage(
       pw.MultiPage(
@@ -135,7 +172,7 @@ class WordToPdfConverter {
           margin: const pw.EdgeInsets.fromLTRB(54, 54, 54, 54),
           theme: theme,
         ),
-        build: (context) => _buildPdfWidgetList(blockList),
+        build: (context) => _buildPdfWidgetList(blockList, fontConfig),
       ),
     );
     debugPrint('WordToPdf _convertOoxmlToPdf addPage done');
@@ -147,44 +184,193 @@ class WordToPdfConverter {
     debugPrint('WordToPdf _convertOoxmlToPdf save done path=$outputPath');
   }
 
-  static Future<pw.Font?> _loadPdfFont() async {
-    const candidatePathList = <String>[
-      '/system/fonts/NotoSansSC-Regular.otf',
-      '/system/fonts/DroidSansFallback.ttf',
-      '/System/Library/Fonts/PingFang.ttc',
-      '/System/Library/Fonts/Hiragino Sans GB.ttc',
-      '/System/Library/Fonts/STHeiti Light.ttc',
-      '/System/Library/Fonts/STHeiti Medium.ttc',
-    ];
-    for (final path in candidatePathList) {
-      if (path.toLowerCase().endsWith('.ttc')) {
-        debugPrint('WordToPdf _loadPdfFont skip collection font path=$path');
-        continue;
-      }
-      final file = File(path);
-      if (!await file.exists()) {
-        continue;
-      }
-      try {
-        final bytes = await file.readAsBytes();
-        debugPrint('WordToPdf _loadPdfFont use local path=$path');
-        return pw.Font.ttf(ByteData.sublistView(bytes));
-      } catch (_) {
-        continue;
+  static Future<_PdfFontConfig> _loadPdfFontConfig({
+    required Uint8List? assetFontBytes,
+    required Set<String> preferredFontNameSet,
+  }) async {
+    final fallback = <pw.Font>[];
+    final fallbackKeySet = <String>{};
+
+    void addFont(String key, pw.Font font) {
+      if (fallbackKeySet.add(key)) {
+        fallback.add(font);
       }
     }
 
-    try {
-      debugPrint('WordToPdf _loadPdfFont use google font');
-      return await PdfGoogleFonts.notoSansSCRegular().timeout(
-        const Duration(seconds: 3),
-      );
-    } catch (_) {}
+    if (assetFontBytes != null && assetFontBytes.isNotEmpty) {
+      try {
+        addFont(
+          defaultCjkFontAssetPath,
+          pw.Font.ttf(ByteData.sublistView(assetFontBytes)),
+        );
+        debugPrint('WordToPdf _loadPdfFontConfig use asset cjk font');
+      } catch (_) {}
+    }
 
-    return null;
+    for (final entry in _buildLocalPdfFontCandidateList(preferredFontNameSet)) {
+      final font = await _loadLocalPdfFont(entry.path);
+      if (font != null) {
+        addFont(entry.path, font);
+      }
+    }
+
+    return _PdfFontConfig(
+      base: fallback.isEmpty ? pw.Font.helvetica() : fallback.first,
+      fontFallback: fallback,
+    );
   }
 
-  static List<pw.Widget> _buildPdfWidgetList(List<_WordBlock> blockList) {
+  static Future<pw.Font?> _loadLocalPdfFont(String path) async {
+    final lowerPath = path.toLowerCase();
+    if (lowerPath.endsWith('.ttc')) {
+      debugPrint('WordToPdf _loadLocalPdfFont skip collection font path=$path');
+      return null;
+    }
+    final file = File(path);
+    if (!await file.exists()) {
+      return null;
+    }
+    try {
+      final bytes = await file.readAsBytes();
+      debugPrint('WordToPdf _loadLocalPdfFont use local path=$path');
+      return pw.Font.ttf(ByteData.sublistView(bytes));
+    } catch (_) {
+      return null;
+    }
+  }
+
+  static List<_FontCandidate> _buildLocalPdfFontCandidateList(
+    Set<String> preferredFontNameSet,
+  ) {
+    const candidateList = <_FontCandidate>[
+      _FontCandidate(
+        path: '/system/fonts/NotoSansSC-Regular.otf',
+        aliases: {'notosanssc', 'noto sans sc', '思源黑体'},
+      ),
+      _FontCandidate(
+        path: '/system/fonts/NotoSansCJK-Regular.ttc',
+        aliases: {'notosanscjk', 'noto sans cjk', '思源黑体'},
+      ),
+      _FontCandidate(
+        path: '/system/fonts/DroidSansFallback.ttf',
+        aliases: {'droidsansfallback'},
+      ),
+      _FontCandidate(
+        path: '/system/fonts/Roboto-Regular.ttf',
+        aliases: {'roboto'},
+      ),
+      _FontCandidate(
+        path: '/System/Library/Fonts/Supplemental/Arial Unicode.ttf',
+        aliases: {'arial unicode ms', 'arialunicode'},
+      ),
+      _FontCandidate(
+        path: '/System/Library/Fonts/Supplemental/Arial.ttf',
+        aliases: {'arial'},
+      ),
+      _FontCandidate(
+        path: '/System/Library/Fonts/Supplemental/Songti.ttc',
+        aliases: {'宋体', 'songti', 'simsun'},
+      ),
+      _FontCandidate(
+        path: '/System/Library/Fonts/PingFang.ttc',
+        aliases: {'苹方-简', 'pingfang', '-webkit-standard'},
+      ),
+      _FontCandidate(
+        path: '/System/Library/Fonts/Hiragino Sans GB.ttc',
+        aliases: {'hiragino sans gb', '冬青黑体'},
+      ),
+      _FontCandidate(
+        path: '/System/Library/Fonts/STHeiti Light.ttc',
+        aliases: {'黑体', 'stheiti', 'simhei'},
+      ),
+      _FontCandidate(
+        path: '/System/Library/Fonts/STHeiti Medium.ttc',
+        aliases: {'黑体', 'stheiti', 'simhei'},
+      ),
+      _FontCandidate(
+        path: '/Library/Fonts/Arial Unicode.ttf',
+        aliases: {'arial unicode ms', 'arialunicode'},
+      ),
+      _FontCandidate(path: '/Library/Fonts/Arial.ttf', aliases: {'arial'}),
+    ];
+
+    bool matchesPreferredFont(_FontCandidate candidate) {
+      if (preferredFontNameSet.isEmpty) {
+        return false;
+      }
+      for (final alias in candidate.aliases) {
+        if (preferredFontNameSet.contains(_normalizeFontName(alias))) {
+          return true;
+        }
+      }
+      return false;
+    }
+
+    final preferred = candidateList.where(matchesPreferredFont).toList();
+    final remaining = candidateList
+        .where((candidate) => !preferred.contains(candidate))
+        .toList();
+    return <_FontCandidate>[...preferred, ...remaining];
+  }
+
+  static Set<String> _buildOoxmlFontNameSet(
+    Archive archive,
+    XmlDocument documentXml,
+  ) {
+    final fontNameSet = <String>{};
+
+    void addFontName(String? value) {
+      final normalized = _normalizeFontName(value ?? '');
+      if (normalized.isNotEmpty) {
+        fontNameSet.add(normalized);
+      }
+    }
+
+    for (final element in documentXml.findAllElements('w:rFonts')) {
+      addFontName(element.getAttribute('w:ascii'));
+      addFontName(element.getAttribute('ascii'));
+      addFontName(element.getAttribute('w:hAnsi'));
+      addFontName(element.getAttribute('hAnsi'));
+      addFontName(element.getAttribute('w:eastAsia'));
+      addFontName(element.getAttribute('eastAsia'));
+      addFontName(element.getAttribute('w:cs'));
+      addFontName(element.getAttribute('cs'));
+    }
+
+    final fontTableFile = archive.findFile('word/fontTable.xml');
+    final content = fontTableFile?.content;
+    if (content is List<int>) {
+      try {
+        final fontTableXml = XmlDocument.parse(utf8.decode(content));
+        for (final fontElement in fontTableXml.findAllElements('w:font')) {
+          final name =
+              fontElement.getAttribute('w:name') ??
+              fontElement.getAttribute('name');
+          final normalizedName = _normalizeFontName(name ?? '');
+          if (!fontNameSet.contains(normalizedName)) {
+            continue;
+          }
+          final altNameElement = fontElement.getElement('w:altName');
+          addFontName(
+            altNameElement?.getAttribute('w:val') ??
+                altNameElement?.getAttribute('val'),
+          );
+        }
+      } catch (_) {}
+    }
+
+    debugPrint('WordToPdf _buildOoxmlFontNameSet fonts=$fontNameSet');
+    return fontNameSet;
+  }
+
+  static String _normalizeFontName(String value) {
+    return value.trim().toLowerCase().replaceAll(RegExp(r'\s+'), ' ');
+  }
+
+  static List<pw.Widget> _buildPdfWidgetList(
+    List<_WordBlock> blockList,
+    _PdfFontConfig fontConfig,
+  ) {
     final widgetList = <pw.Widget>[];
     for (final block in blockList) {
       switch (block) {
@@ -194,13 +380,13 @@ class WordToPdfConverter {
           }
           break;
         case _WordParagraphBlock():
-          widgetList.add(_buildParagraphWidget(block));
+          widgetList.add(_buildParagraphWidget(block, fontConfig));
           break;
         case _WordImageBlock():
           widgetList.add(_buildImageWidget(block));
           break;
         case _WordTableBlock():
-          widgetList.add(_buildTableWidget(block));
+          widgetList.add(_buildTableWidget(block, fontConfig));
           break;
       }
     }
@@ -210,7 +396,10 @@ class WordToPdfConverter {
     return widgetList;
   }
 
-  static pw.Widget _buildParagraphWidget(_WordParagraphBlock block) {
+  static pw.Widget _buildParagraphWidget(
+    _WordParagraphBlock block,
+    _PdfFontConfig fontConfig,
+  ) {
     if (block.isEmpty) {
       return pw.SizedBox(height: 14);
     }
@@ -226,6 +415,11 @@ class WordToPdfConverter {
           return pw.TextSpan(
             text: span.text,
             style: pw.TextStyle(
+              font: fontConfig.base,
+              fontNormal: fontConfig.base,
+              fontBold: fontConfig.base,
+              fontItalic: fontConfig.base,
+              fontBoldItalic: fontConfig.base,
               fontSize: fontSize,
               fontWeight: span.bold ? pw.FontWeight.bold : pw.FontWeight.normal,
               fontStyle: span.italic
@@ -235,6 +429,7 @@ class WordToPdfConverter {
                   ? pw.TextDecoration.underline
                   : pw.TextDecoration.none,
               lineSpacing: 2,
+              fontFallback: fontConfig.fontFallback,
             ),
           );
         }).toList(),
@@ -246,7 +441,18 @@ class WordToPdfConverter {
             children: <pw.Widget>[
               pw.Padding(
                 padding: const pw.EdgeInsets.only(top: 1),
-                child: pw.Text('•', style: pw.TextStyle(fontSize: fontSize)),
+                child: pw.Text(
+                  '•',
+                  style: pw.TextStyle(
+                    font: fontConfig.base,
+                    fontNormal: fontConfig.base,
+                    fontBold: fontConfig.base,
+                    fontItalic: fontConfig.base,
+                    fontBoldItalic: fontConfig.base,
+                    fontSize: fontSize,
+                    fontFallback: fontConfig.fontFallback,
+                  ),
+                ),
               ),
               pw.SizedBox(width: 6),
               pw.Expanded(child: richText),
@@ -276,7 +482,10 @@ class WordToPdfConverter {
     );
   }
 
-  static pw.Widget _buildTableWidget(_WordTableBlock block) {
+  static pw.Widget _buildTableWidget(
+    _WordTableBlock block,
+    _PdfFontConfig fontConfig,
+  ) {
     return pw.Padding(
       padding: const pw.EdgeInsets.only(top: 6, bottom: 12),
       child: pw.Table(
@@ -291,7 +500,12 @@ class WordToPdfConverter {
                   crossAxisAlignment: pw.CrossAxisAlignment.start,
                   children: cell.isEmpty
                       ? <pw.Widget>[pw.SizedBox(height: 14)]
-                      : cell.map(_buildTableParagraphWidget).toList(),
+                      : cell.map((paragraph) {
+                          return _buildTableParagraphWidget(
+                            paragraph,
+                            fontConfig,
+                          );
+                        }).toList(),
                 ),
               );
             }).toList(),
@@ -301,7 +515,10 @@ class WordToPdfConverter {
     );
   }
 
-  static pw.Widget _buildTableParagraphWidget(_WordParagraphBlock block) {
+  static pw.Widget _buildTableParagraphWidget(
+    _WordParagraphBlock block,
+    _PdfFontConfig fontConfig,
+  ) {
     if (block.isEmpty) {
       return pw.SizedBox(height: 12);
     }
@@ -313,6 +530,11 @@ class WordToPdfConverter {
             return pw.TextSpan(
               text: span.text,
               style: pw.TextStyle(
+                font: fontConfig.base,
+                fontNormal: fontConfig.base,
+                fontBold: fontConfig.base,
+                fontItalic: fontConfig.base,
+                fontBoldItalic: fontConfig.base,
                 fontSize: 11,
                 fontWeight: span.bold
                     ? pw.FontWeight.bold
@@ -323,6 +545,7 @@ class WordToPdfConverter {
                 decoration: span.underline
                     ? pw.TextDecoration.underline
                     : pw.TextDecoration.none,
+                fontFallback: fontConfig.fontFallback,
               ),
             );
           }).toList(),
@@ -387,7 +610,7 @@ class WordToPdfConverter {
       final runProp = run.getElement('w:rPr');
       final bool bold = runProp?.getElement('w:b') != null;
       final bool italic = runProp?.getElement('w:i') != null;
-      final bool underline = runProp?.getElement('w:u') != null;
+      final bool underline = _queryRunUnderline(runProp);
 
       for (final br in run.findElements('w:br')) {
         final String type =
@@ -419,7 +642,10 @@ class WordToPdfConverter {
         );
       }
 
-      final _WordImageBlock? imageBlock = _parseRunImageBlock(run, imageBytesMap);
+      final _WordImageBlock? imageBlock = _parseRunImageBlock(
+        run,
+        imageBytesMap,
+      );
       if (imageBlock != null) {
         flushParagraph();
         blockList.add(imageBlock);
@@ -458,6 +684,28 @@ class WordToPdfConverter {
       rowList.add(cellList);
     }
     return _WordTableBlock(rowList: rowList);
+  }
+
+  static bool _queryRunUnderline(XmlElement? runProp) {
+    final underlineElement = runProp?.getElement('w:u');
+    if (underlineElement == null) {
+      return false;
+    }
+    final value =
+        underlineElement.getAttribute('w:val') ??
+        underlineElement.getAttribute('val') ??
+        '';
+    if (value.isEmpty) {
+      return true;
+    }
+    switch (value.toLowerCase()) {
+      case '0':
+      case 'false':
+      case 'none':
+        return false;
+      default:
+        return true;
+    }
   }
 
   static String _buildOoxmlHtml(List<int> bytes) {
@@ -782,11 +1030,7 @@ class _WordParagraphBlock extends _WordBlock {
 }
 
 class _WordImageBlock extends _WordBlock {
-  const _WordImageBlock({
-    required this.bytes,
-    this.widthPt,
-    this.heightPt,
-  });
+  const _WordImageBlock({required this.bytes, this.widthPt, this.heightPt});
 
   final Uint8List bytes;
   final double? widthPt;
@@ -811,4 +1055,18 @@ class _WordSpan {
   final bool bold;
   final bool italic;
   final bool underline;
+}
+
+class _PdfFontConfig {
+  const _PdfFontConfig({required this.base, required this.fontFallback});
+
+  final pw.Font base;
+  final List<pw.Font> fontFallback;
+}
+
+class _FontCandidate {
+  const _FontCandidate({required this.path, required this.aliases});
+
+  final String path;
+  final Set<String> aliases;
 }

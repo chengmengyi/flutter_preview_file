@@ -212,9 +212,14 @@ class FileToolsService {
       inputPath: path,
     );
     if (canRunInBackground) {
+      final assetFontBytes =
+          await WordToPdfConverter.loadDefaultPdfFontAssetBytes();
       final result = await _runFileToolsTaskInBackground(
         isolateEntry: _convertWordToPdfOoxmlIsolateEntry,
-        payload: <String, dynamic>{"fileInfo": _fileInfoToMap(fileInfo)},
+        payload: <String, dynamic>{
+          "fileInfo": _fileInfoToMap(fileInfo),
+          "assetFontBytes": assetFontBytes,
+        },
         fallbackErrorMessage: "Failed to convert Word to PDF",
         onProgress: onProgress,
         taskControl: taskControl,
@@ -676,9 +681,16 @@ Future<void> _convertWordToPdfOoxmlIsolateEntry(
       extension: "pdf",
     );
     _sendTaskProgress(sendPort, 0.3);
+    final rawAssetFontBytes = message["assetFontBytes"];
+    final assetFontBytes = rawAssetFontBytes is Uint8List
+        ? rawAssetFontBytes
+        : rawAssetFontBytes is List<int>
+        ? Uint8List.fromList(rawAssetFontBytes)
+        : null;
     await WordToPdfConverter.convertOoxmlFileToPdf(
       inputPath: path,
       outputPath: outputFile.path,
+      assetFontBytes: assetFontBytes,
     );
     _sendTaskProgress(sendPort, 0.9);
     final stat = await outputFile.stat();
