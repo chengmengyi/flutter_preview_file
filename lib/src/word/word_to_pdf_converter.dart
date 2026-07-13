@@ -486,6 +486,31 @@ class WordToPdfConverter {
     _WordTableBlock block,
     _PdfFontConfig fontConfig,
   ) {
+    if (_shouldBuildTableAsBlockList(block)) {
+      final cell = block.rowList.first.first;
+      return pw.Padding(
+        padding: const pw.EdgeInsets.only(top: 6, bottom: 12),
+        child: pw.Container(
+          decoration: pw.BoxDecoration(
+            color: PdfColors.grey100,
+            border: pw.Border.all(color: PdfColors.grey400, width: 0.5),
+          ),
+          padding: const pw.EdgeInsets.all(6),
+          child: pw.Column(
+            crossAxisAlignment: pw.CrossAxisAlignment.start,
+            children: cell.isEmpty
+                ? <pw.Widget>[pw.SizedBox(height: 14)]
+                : cell.expand((paragraph) {
+                    return _buildTableParagraphLineWidgets(
+                      paragraph,
+                      fontConfig,
+                    );
+                  }).toList(),
+          ),
+        ),
+      );
+    }
+
     return pw.Padding(
       padding: const pw.EdgeInsets.only(top: 6, bottom: 12),
       child: pw.Table(
@@ -515,6 +540,41 @@ class WordToPdfConverter {
     );
   }
 
+  static bool _shouldBuildTableAsBlockList(_WordTableBlock block) {
+    if (block.rowList.length != 1 || block.rowList.first.length != 1) {
+      return false;
+    }
+    final cell = block.rowList.first.first;
+    final text = cell
+        .expand((paragraph) => paragraph.spanList)
+        .map((span) => span.text)
+        .join();
+    return text.length > 500 || '\n'.allMatches(text).length > 8;
+  }
+
+  static List<pw.Widget> _buildTableParagraphLineWidgets(
+    _WordParagraphBlock block,
+    _PdfFontConfig fontConfig,
+  ) {
+    if (block.isEmpty) {
+      return <pw.Widget>[pw.SizedBox(height: 12)];
+    }
+    final lineList = _splitSpanListByLineBreak(block.spanList);
+    if (lineList.isEmpty) {
+      return <pw.Widget>[pw.SizedBox(height: 12)];
+    }
+    return lineList.map((lineSpanList) {
+      if (lineSpanList.isEmpty ||
+          lineSpanList.every((span) => span.text.trim().isEmpty)) {
+        return pw.SizedBox(height: 12);
+      }
+      return pw.Padding(
+        padding: const pw.EdgeInsets.only(bottom: 3),
+        child: _buildTableRichText(lineSpanList, fontConfig),
+      );
+    }).toList();
+  }
+
   static pw.Widget _buildTableParagraphWidget(
     _WordParagraphBlock block,
     _PdfFontConfig fontConfig,
@@ -524,34 +584,65 @@ class WordToPdfConverter {
     }
     return pw.Padding(
       padding: const pw.EdgeInsets.only(bottom: 6),
-      child: pw.RichText(
-        text: pw.TextSpan(
-          children: block.spanList.map((span) {
-            return pw.TextSpan(
-              text: span.text,
-              style: pw.TextStyle(
-                font: fontConfig.base,
-                fontNormal: fontConfig.base,
-                fontBold: fontConfig.base,
-                fontItalic: fontConfig.base,
-                fontBoldItalic: fontConfig.base,
-                fontSize: 11,
-                fontWeight: span.bold
-                    ? pw.FontWeight.bold
-                    : pw.FontWeight.normal,
-                fontStyle: span.italic
-                    ? pw.FontStyle.italic
-                    : pw.FontStyle.normal,
-                decoration: span.underline
-                    ? pw.TextDecoration.underline
-                    : pw.TextDecoration.none,
-                fontFallback: fontConfig.fontFallback,
-              ),
-            );
-          }).toList(),
-        ),
+      child: _buildTableRichText(block.spanList, fontConfig),
+    );
+  }
+
+  static pw.RichText _buildTableRichText(
+    List<_WordSpan> spanList,
+    _PdfFontConfig fontConfig,
+  ) {
+    return pw.RichText(
+      text: pw.TextSpan(
+        children: spanList.map((span) {
+          return pw.TextSpan(
+            text: span.text,
+            style: pw.TextStyle(
+              font: fontConfig.base,
+              fontNormal: fontConfig.base,
+              fontBold: fontConfig.base,
+              fontItalic: fontConfig.base,
+              fontBoldItalic: fontConfig.base,
+              fontSize: 11,
+              fontWeight: span.bold ? pw.FontWeight.bold : pw.FontWeight.normal,
+              fontStyle: span.italic
+                  ? pw.FontStyle.italic
+                  : pw.FontStyle.normal,
+              decoration: span.underline
+                  ? pw.TextDecoration.underline
+                  : pw.TextDecoration.none,
+              fontFallback: fontConfig.fontFallback,
+            ),
+          );
+        }).toList(),
       ),
     );
+  }
+
+  static List<List<_WordSpan>> _splitSpanListByLineBreak(
+    List<_WordSpan> spanList,
+  ) {
+    final lineList = <List<_WordSpan>>[<_WordSpan>[]];
+    for (final span in spanList) {
+      final partList = span.text.split('\n');
+      for (var index = 0; index < partList.length; index++) {
+        final part = partList[index];
+        if (part.isNotEmpty) {
+          lineList.last.add(
+            _WordSpan(
+              text: part,
+              bold: span.bold,
+              italic: span.italic,
+              underline: span.underline,
+            ),
+          );
+        }
+        if (index < partList.length - 1) {
+          lineList.add(<_WordSpan>[]);
+        }
+      }
+    }
+    return lineList;
   }
 
   static List<_WordBlock> _buildOoxmlBlockList(
@@ -612,34 +703,33 @@ class WordToPdfConverter {
       final bool italic = runProp?.getElement('w:i') != null;
       final bool underline = _queryRunUnderline(runProp);
 
-      for (final br in run.findElements('w:br')) {
-        final String type =
-            br.getAttribute('w:type') ?? br.getAttribute('type') ?? '';
-        if (type != 'page') {
-          spanList.add(
-            const _WordSpan(
-              text: '\n',
-              bold: false,
-              italic: false,
-              underline: false,
-            ),
-          );
+      for (final child in run.childElements) {
+        if (child.name.qualified == 'w:t') {
+          final text = child.innerText;
+          if (text.isNotEmpty) {
+            spanList.add(
+              _WordSpan(
+                text: text,
+                bold: bold,
+                italic: italic,
+                underline: underline,
+              ),
+            );
+          }
+        } else if (child.name.qualified == 'w:br') {
+          final String type =
+              child.getAttribute('w:type') ?? child.getAttribute('type') ?? '';
+          if (type != 'page') {
+            spanList.add(
+              _WordSpan(
+                text: '\n',
+                bold: bold,
+                italic: italic,
+                underline: underline,
+              ),
+            );
+          }
         }
-      }
-
-      final String text = run
-          .findAllElements('w:t')
-          .map((element) => element.innerText)
-          .join();
-      if (text.isNotEmpty) {
-        spanList.add(
-          _WordSpan(
-            text: text,
-            bold: bold,
-            italic: italic,
-            underline: underline,
-          ),
-        );
       }
 
       final _WordImageBlock? imageBlock = _parseRunImageBlock(
