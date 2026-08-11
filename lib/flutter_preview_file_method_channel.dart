@@ -43,6 +43,19 @@ class MethodChannelFlutterPreviewFile extends FlutterPreviewFilePlatform {
   }
 
   @override
+  Future<String?> generatePdfFromImages({
+    required List<Map<String, dynamic>> imageList,
+    required String outputPath,
+    int? maxSidePx,
+  }) {
+    return methodChannel.invokeMethod<String>('generatePdfFromImages', {
+      'imageList': imageList,
+      'outputPath': outputPath,
+      'maxSidePx': maxSidePx,
+    });
+  }
+
+  @override
   Future<bool> saveDocTextContent({
     required String path,
     required String text,

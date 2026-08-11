@@ -2,12 +2,12 @@ import 'dart:async';
 import 'dart:io';
 import 'dart:isolate';
 import 'dart:math' as math;
-import 'dart:typed_data';
-import 'dart:ui' show Offset, Rect;
 
+import 'package:flutter/services.dart';
 import 'package:photo_manager/photo_manager.dart';
 
 import '../flutter_preview_file.dart';
+import '../flutter_preview_file_platform_interface.dart';
 import 'pdf/pdf_to_word_converter.dart';
 import 'word/word_to_pdf_converter.dart';
 
@@ -69,8 +69,9 @@ class FileToolsService {
       return null;
     }
     final extension = _queryFileExtension(fileInfo.name ?? oldPath);
-    final targetName =
-        extension.isEmpty ? targetBaseName : "$targetBaseName.$extension";
+    final targetName = extension.isEmpty
+        ? targetBaseName
+        : "$targetBaseName.$extension";
     final targetPath = "${oldFile.parent.path}/$targetName";
     if (targetPath == oldPath) {
       final stat = await oldFile.stat();
@@ -125,15 +126,15 @@ class FileToolsService {
       case FileToolsSortType.az:
         result.sort(
           (a, b) => (a.name ?? "").toLowerCase().compareTo(
-                (b.name ?? "").toLowerCase(),
-              ),
+            (b.name ?? "").toLowerCase(),
+          ),
         );
         break;
       case FileToolsSortType.za:
         result.sort(
           (a, b) => (b.name ?? "").toLowerCase().compareTo(
-                (a.name ?? "").toLowerCase(),
-              ),
+            (a.name ?? "").toLowerCase(),
+          ),
         );
         break;
     }
@@ -290,10 +291,10 @@ class FileToolsService {
           await taskControl?.checkpoint();
           final Uint8List? pageImageBytes =
               await FlutterPreviewFile.renderPdfPageToImageBytes(
-            pdfPath: path,
-            pageIndex: pageIndex,
-            width: 1200,
-          );
+                pdfPath: path,
+                pageIndex: pageIndex,
+                width: 1200,
+              );
           pageImageBytesList.add(pageImageBytes);
           onProgress?.call(0.2 + ((pageIndex + 1) / pageCount) * 0.35);
         }
@@ -302,8 +303,9 @@ class FileToolsService {
       await PdfToWordConverter.convert(
         inputPath: path,
         outputPath: outputFile.path,
-        pageImageBytesList:
-            pageImageBytesList.isEmpty ? null : pageImageBytesList,
+        pageImageBytesList: pageImageBytesList.isEmpty
+            ? null
+            : pageImageBytesList,
         onProgress: (double progress) {
           onProgress?.call(0.55 + progress * 0.35);
         },
@@ -453,6 +455,35 @@ class FileToolsService {
       throw Exception("Please select at least one image");
     }
     onProgress?.call(0);
+    if (Platform.isAndroid) {
+      final outputFile = await _createImagesToPdfOutputFile(
+        outputFileName: outputFileName,
+      );
+      try {
+        onProgress?.call(0.2);
+        final result = await _runFileToolsTaskInBackground(
+          isolateEntry: _generatePdfFromImagesAndroidIsolateEntry,
+          payload: <String, dynamic>{
+            "imageList":
+                imageList.map(_fileInfoToMap).toList(growable: false),
+            "outputPath": outputFile.path,
+            "rootIsolateToken": RootIsolateToken.instance,
+          },
+          fallbackErrorMessage: "Failed to generate PDF",
+          onProgress: onProgress,
+          taskControl: taskControl,
+        );
+        await taskControl?.checkpoint();
+        await FlutterPreviewFile.scanFile(result.path ?? "");
+        onProgress?.call(1);
+        return result;
+      } catch (_) {
+        if (await outputFile.exists()) {
+          await outputFile.delete();
+        }
+        rethrow;
+      }
+    }
     final result = await _runFileToolsTaskInBackground(
       isolateEntry: _generatePdfFromImagesIsolateEntry,
       payload: <String, dynamic>{
@@ -1393,6 +1424,52 @@ Future<void> _generatePdfFromImagesIsolateEntry(
   }
 }
 
+Future<void> _generatePdfFromImagesAndroidIsolateEntry(
+  Map<String, dynamic> message,
+) async {
+  final sendPort = message["sendPort"] as SendPort;
+  final rootIsolateToken = message["rootIsolateToken"] as RootIsolateToken?;
+  try {
+    if (rootIsolateToken == null) {
+      throw Exception("Root isolate token is invalid");
+    }
+    BackgroundIsolateBinaryMessenger.ensureInitialized(rootIsolateToken);
+    final rawImageList = message["imageList"] as List<dynamic>? ?? <dynamic>[];
+    final outputPath = message["outputPath"]?.toString() ?? "";
+    final imageList = rawImageList
+        .whereType<Map>()
+        .map((item) => _fileInfoFromMap(Map<String, dynamic>.from(item)))
+        .toList(growable: false);
+    if (imageList.isEmpty) {
+      throw Exception("Please select at least one image");
+    }
+    if (outputPath.isEmpty) {
+      throw Exception("Output path is invalid");
+    }
+    await FlutterPreviewFilePlatform.instance.generatePdfFromImages(
+      imageList: imageList.map(_fileInfoToMap).toList(growable: false),
+      outputPath: outputPath,
+    );
+    final outputFile = File(outputPath);
+    if (!await outputFile.exists()) {
+      throw Exception("Failed to generate PDF");
+    }
+    final stat = await outputFile.stat();
+    _sendTaskResult(
+      sendPort,
+      FileToolsFileInfo(
+        name: outputFile.uri.pathSegments.last,
+        type: FileToolsDocumentType.pdf,
+        updateTime: stat.modified.millisecondsSinceEpoch,
+        size: stat.size,
+        path: outputFile.path,
+      ),
+    );
+  } catch (e) {
+    _sendTaskError(sendPort, e, fallbackMessage: "Failed to generate PDF");
+  }
+}
+
 void _sendTaskProgress(SendPort sendPort, double progress) {
   sendPort.send(<String, dynamic>{
     "type": "progress",
@@ -1434,8 +1511,9 @@ FileToolsFileInfo _fileInfoFromMap(Map<String, dynamic> item) {
   final rawTypeIndex = item["typeIndex"];
   return FileToolsFileInfo(
     name: item["name"] as String?,
-    type:
-        rawTypeIndex is int ? FileToolsDocumentType.values[rawTypeIndex] : null,
+    type: rawTypeIndex is int
+        ? FileToolsDocumentType.values[rawTypeIndex]
+        : null,
     updateTime: item["updateTime"] as int?,
     size: item["size"] as int?,
     path: item["path"] as String?,

@@ -44,6 +44,16 @@ abstract class FlutterPreviewFilePlatform extends PlatformInterface {
     throw UnimplementedError('convertHtmlToPdf() has not been implemented.');
   }
 
+  Future<String?> generatePdfFromImages({
+    required List<Map<String, dynamic>> imageList,
+    required String outputPath,
+    int? maxSidePx,
+  }) {
+    throw UnimplementedError(
+      'generatePdfFromImages() has not been implemented.',
+    );
+  }
+
   Future<bool> saveDocTextContent({
     required String path,
     required String text,
