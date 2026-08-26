@@ -4,10 +4,8 @@ import android.app.Activity
 import android.content.ContentValues
 import android.content.Intent
 import android.graphics.Bitmap
-import android.graphics.BitmapFactory
 import android.graphics.Canvas
 import android.graphics.Color
-import android.graphics.Matrix
 import android.graphics.pdf.PdfDocument
 import android.graphics.pdf.PdfRenderer
 import android.media.MediaScannerConnection
@@ -24,7 +22,6 @@ import android.webkit.MimeTypeMap
 import android.webkit.WebView
 import android.webkit.WebViewClient
 import android.widget.FrameLayout
-import androidx.exifinterface.media.ExifInterface
 import io.flutter.embedding.engine.plugins.FlutterPlugin
 import io.flutter.embedding.engine.plugins.activity.ActivityAware
 import io.flutter.embedding.engine.plugins.activity.ActivityPluginBinding
@@ -34,12 +31,6 @@ import io.flutter.plugin.common.MethodChannel.MethodCallHandler
 import io.flutter.plugin.common.MethodChannel.Result
 import org.apache.poi.hwpf.HWPFDocument
 import org.apache.poi.hwpf.converter.WordToHtmlConverter
-import com.tom_roush.pdfbox.android.PDFBoxResourceLoader
-import com.tom_roush.pdfbox.pdmodel.PDDocument
-import com.tom_roush.pdfbox.pdmodel.PDPage
-import com.tom_roush.pdfbox.pdmodel.PDPageContentStream
-import com.tom_roush.pdfbox.pdmodel.common.PDRectangle
-import com.tom_roush.pdfbox.pdmodel.graphics.image.LosslessFactory
 import java.io.File
 import java.io.FileInputStream
 import java.io.FileOutputStream
@@ -52,8 +43,6 @@ import javax.xml.transform.OutputKeys
 import javax.xml.transform.TransformerFactory
 import javax.xml.transform.dom.DOMSource
 import javax.xml.transform.stream.StreamResult
-import kotlin.math.max
-import kotlin.math.min
 
 class FlutterPreviewFilePlugin : FlutterPlugin, MethodCallHandler, ActivityAware {
     companion object {
@@ -64,10 +53,12 @@ class FlutterPreviewFilePlugin : FlutterPlugin, MethodCallHandler, ActivityAware
 
     private lateinit var channel: MethodChannel
     private lateinit var binding: FlutterPlugin.FlutterPluginBinding
+    private lateinit var pdfImageWorkerClient: PdfImageWorkerClient
     private var activity: Activity? = null
 
     override fun onAttachedToEngine(flutterPluginBinding: FlutterPlugin.FlutterPluginBinding) {
         binding = flutterPluginBinding
+        pdfImageWorkerClient = PdfImageWorkerClient(flutterPluginBinding.applicationContext)
         channel = MethodChannel(flutterPluginBinding.binaryMessenger, "flutter_preview_file")
         channel.setMethodCallHandler(this)
     }
@@ -270,21 +261,12 @@ class FlutterPreviewFilePlugin : FlutterPlugin, MethodCallHandler, ActivityAware
                     )
                     return
                 }
-                try {
-                    result.success(
-                        generatePdfFromImages(
-                            imageList = rawImageList,
-                            outputPath = outputPath,
-                            maxSidePx = maxSidePx,
-                        ),
-                    )
-                } catch (e: Exception) {
-                    result.error(
-                        "generate_pdf_failed",
-                        e.message ?: "Failed to generate PDF",
-                        null,
-                    )
-                }
+                pdfImageWorkerClient.generate(
+                    imagePaths = rawImageList.map { it["path"]?.toString().orEmpty() },
+                    outputPath = outputPath,
+                    maxSidePx = maxSidePx,
+                    result = result,
+                )
             }
 
             else -> result.notImplemented()
@@ -293,6 +275,7 @@ class FlutterPreviewFilePlugin : FlutterPlugin, MethodCallHandler, ActivityAware
 
     override fun onDetachedFromEngine(binding: FlutterPlugin.FlutterPluginBinding) {
         channel.setMethodCallHandler(null)
+        pdfImageWorkerClient.detach()
     }
 
     override fun onAttachedToActivity(binding: ActivityPluginBinding) {
@@ -503,148 +486,6 @@ class FlutterPreviewFilePlugin : FlutterPlugin, MethodCallHandler, ActivityAware
         } finally {
             pdfDocument.close()
         }
-    }
-
-    private fun generatePdfFromImages(
-        imageList: List<Map<String, Any?>>,
-        outputPath: String,
-        maxSidePx: Int,
-    ): String {
-        PDFBoxResourceLoader.init(binding.applicationContext)
-        val outputFile = File(outputPath)
-        outputFile.parentFile?.mkdirs()
-
-        PDDocument().use { document ->
-            var addedPages = 0
-            for (imageInfo in imageList) {
-                val path = imageInfo["path"]?.toString().orEmpty()
-                if (path.isEmpty()) {
-                    throw IllegalArgumentException("Image path is invalid")
-                }
-                val imageFile = File(path)
-                if (!imageFile.exists()) {
-                    throw IllegalStateException(
-                        "The image does not exist. Please select another image",
-                    )
-                }
-                val bitmap = decodeBitmapForPdf(imageFile, maxSidePx)
-                    ?: continue
-                val rotation = readExifRotationDegrees(imageFile)
-                val rotated = rotateBitmap(bitmap, rotation)
-                if (rotated !== bitmap) {
-                    bitmap.recycle()
-                }
-
-                try {
-                    val pageRect =
-                        if (rotated.width >= rotated.height) {
-                            PDRectangle(PDRectangle.A4.height, PDRectangle.A4.width)
-                        } else {
-                            PDRectangle.A4
-                        }
-                    val page = PDPage(pageRect)
-                    document.addPage(page)
-                    addedPages++
-
-                    val image = LosslessFactory.createFromImage(document, rotated)
-                    val pageWidth = page.mediaBox.width
-                    val pageHeight = page.mediaBox.height
-                    val scale = min(
-                        pageWidth / rotated.width.toFloat(),
-                        pageHeight / rotated.height.toFloat(),
-                    )
-                    val drawWidth = rotated.width * scale
-                    val drawHeight = rotated.height * scale
-                    val x = (pageWidth - drawWidth) / 2f
-                    val y = (pageHeight - drawHeight) / 2f
-
-                    PDPageContentStream(
-                        document,
-                        page,
-                        PDPageContentStream.AppendMode.OVERWRITE,
-                        true,
-                    ).use { contentStream ->
-                        contentStream.drawImage(image, x, y, drawWidth, drawHeight)
-                    }
-                } finally {
-                    rotated.recycle()
-                }
-            }
-
-            if (addedPages <= 0) {
-                throw IllegalStateException("No pages added")
-            }
-            document.save(outputFile)
-        }
-
-        return outputFile.absolutePath
-    }
-
-    private fun decodeBitmapForPdf(
-        imageFile: File,
-        maxSidePx: Int,
-    ): Bitmap? {
-        val bounds = BitmapFactory.Options().apply {
-            inJustDecodeBounds = true
-        }
-        FileInputStream(imageFile).use { inputStream ->
-            BitmapFactory.decodeStream(inputStream, null, bounds)
-        }
-        val width = bounds.outWidth
-        val height = bounds.outHeight
-        if (width <= 0 || height <= 0) {
-            return null
-        }
-
-        val safeMaxSide = maxSidePx.coerceAtLeast(1)
-        var inSampleSize = 1
-        while (max(width / inSampleSize, height / inSampleSize) > safeMaxSide) {
-            inSampleSize *= 2
-        }
-
-        val options = BitmapFactory.Options().apply {
-            this.inSampleSize = inSampleSize.coerceAtLeast(1)
-            inPreferredConfig = Bitmap.Config.ARGB_8888
-        }
-        return FileInputStream(imageFile).use { inputStream ->
-            BitmapFactory.decodeStream(inputStream, null, options)
-        }
-    }
-
-    private fun readExifRotationDegrees(imageFile: File): Int {
-        return try {
-            when (
-                ExifInterface(imageFile.absolutePath).getAttributeInt(
-                    ExifInterface.TAG_ORIENTATION,
-                    ExifInterface.ORIENTATION_NORMAL,
-                )
-            ) {
-                ExifInterface.ORIENTATION_ROTATE_90 -> 90
-                ExifInterface.ORIENTATION_ROTATE_180 -> 180
-                ExifInterface.ORIENTATION_ROTATE_270 -> 270
-                else -> 0
-            }
-        } catch (_: Exception) {
-            0
-        }
-    }
-
-    private fun rotateBitmap(bitmap: Bitmap, degrees: Int): Bitmap {
-        if (degrees % 360 == 0) {
-            return bitmap
-        }
-        val matrix = Matrix().apply {
-            postRotate(degrees.toFloat())
-        }
-        return Bitmap.createBitmap(
-            bitmap,
-            0,
-            0,
-            bitmap.width,
-            bitmap.height,
-            matrix,
-            true,
-        )
     }
 
     private fun scanFile(path: String, result: Result) {
